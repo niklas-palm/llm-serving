@@ -606,12 +606,14 @@ class ServingStack(Stack):
                 raise ConfigError(f"extraEnv: {name} must be a string or number (got {value!r}).")
             env[str(name)] = str(value).lower() if isinstance(value, bool) else str(value)
 
+        container_mib = inst.container_memory_mib // tuning["replicas"]
+        shm_mib = max(8192, container_mib // 2)
         container = task_def.add_container(
             "vllm",
             image=self._container_image(cfg["image"]),
             # Derived from HOST RAM, not GPU count - see hardware.py for why that distinction
             # matters. ECS reserves the whole amount, so this also caps replicas per instance.
-            memory_limit_mib=inst.container_memory_mib // tuning["replicas"],
+            memory_limit_mib=container_mib,
             gpu_count=tuning["tensorParallel"] * tuning["dataParallel"],
             environment=env,
             secrets=container_secrets or None,
@@ -625,7 +627,11 @@ class ServingStack(Stack):
             # workers pass tensors through POSIX shared memory, and Docker's 64 MiB default kills any
             # degree above 1 seconds after start. TP=1 never touches that path, so a conditional value
             # looks fine until someone raises the degree. See docs/troubleshooting.md.
-            linux_parameters=ecs.LinuxParameters(self, "Linux", shared_memory_size=8192),
+            # Half the container's memory, floor 8 GiB: vLLM also puts the CPU KV offload buffer here
+            # (`--kv-offloading-size N` in extraArgs), and a fixed 8 GiB refused to start the engine with
+            # `Insufficient space in /dev/shm: 32768 MiB required, 8192 MiB free`. tmpfs pages are
+            # allocated on write, so a larger cap costs nothing until the buffer is configured and used.
+            linux_parameters=ecs.LinuxParameters(self, "Linux", shared_memory_size=shm_mib),
             # What protects an in-flight request on scale-in or redeploy is the 180 s deregistration
             # delay above: the target is drained before ECS sends SIGTERM, and this vLLM aborts
             # in-flight requests on SIGTERM. This is the wait before SIGKILL after that.

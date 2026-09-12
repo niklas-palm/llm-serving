@@ -438,6 +438,26 @@ If Chat Completions works and `/v1/responses` returns 404, the pinned engine doe
 
 ---
 
+## Symptom: the engine exits during start with `Insufficient space in /dev/shm: 32768 MiB required`
+
+Configuring a host-memory KV tier (`extraArgs: --kv-offloading-size 32`) and the engine start ends in
+`RuntimeError: Insufficient space in /dev/shm: 32768 MiB required, 8192 MiB free`, raised from
+`vllm/v1/kv_offload/cpu/shared_offload_region.py`. ECS restarts the task, so this presents as a
+crash loop and a `cdk deploy` that never finishes. **Cause:** the tier is an mmap file in `/dev/shm`
+(the log line above it reads `Created mmap file /dev/shm/vllm_offload_<engine-id>.mmap`), and the
+container's shared memory is a fixed size. **Fix:** this stack sets `/dev/shm` to half the container's
+memory, so a tier up to that size starts; a larger tier needs a smaller `--kv-offloading-size` or a
+larger instance. Cancel the stuck update with `aws cloudformation cancel-update-stack` first.
+docs/tuning.md, *Offloading the cache to host memory moves the capacity wall*.
+
+## Symptom: the engine refuses `--kv-cache-memory-bytes` with "larger than the available KV cache memory"
+
+`ValueError: To serve at least one request with the model's max seq len (262144), 12.0 GiB KV cache is
+needed, which is larger than the available KV cache memory`. **Cause:** the engine checks that one request
+at `maxModelLen` fits in the cache, and a pinned cache size is compared against the model's full context,
+not against what you intend to send. **Fix:** set `maxModelLen` in the same change to something one
+request's worth of KV fits inside.
+
 ## Symptom: `Insufficient space in /dev/shm`
 
 ```

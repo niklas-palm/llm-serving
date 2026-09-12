@@ -764,7 +764,8 @@ linear-attention mixture of experts on one 96 GB card; output quality of bf16, f
 weights and of the fp8 KV cache on the standard benchmark set (MMLU, ARC, HellaSwag, Winogrande,
 TruthfulQA, GSM8K, IFEval, WikiText perplexity) across four model families; multi-turn traffic against
 round-robin and sticky routing; prompts to 64,000 tokens, unique and cached, on both GPUs; structured
-output; reasoning effort; repeatability across days and regions; agentic quality of every precision on
+output; reasoning effort; KV cache offload to host memory against the GPU cache it extends;
+repeatability across days and regions; agentic quality of every precision on
 BFCL, τ-bench, SWE-bench Verified and structured extraction, with the tool parser in the loop and a
 repeated baseline for the noise floor. **Not measured:** autoscaling timings on fleets other than 6 → 8;
 eight engines on one g7e host (no capacity found); code quality of a base model over an API (the

@@ -1115,6 +1115,47 @@ one engine, so leave it off unless clients keep a cookie per end-user conversati
 a router that knows which engine holds which prefix and the queue depth of each; this project does not
 include one (*What this project does not do*).
 
+#### Offloading the cache to host memory moves the capacity wall, it does not remove it
+
+The cache is per engine and lives in GPU memory, so there are two independent problems: getting a request
+to the engine that holds its blocks (routing, above) and keeping the blocks at all. vLLM can keep them
+somewhere other than HBM: `extraArgs: --kv-offloading-size 32` allocates a 32 GiB host-memory tier and
+copies blocks into it as they leave the GPU, so a later turn reloads them over PCIe instead of prefilling
+them again. Measured on one `g7e.4xlarge` with the 30B fp8 model, six-turn conversations of 8,000 tokens,
+streamed. Its GPU cache is 58.0 GiB, which is 1,266,816 tokens at 48 KiB of KV per token, so the working
+set is stated as a multiple of that:
+
+| Working set | Tier | GPU cache hits | Host tier hits | req/s | TTFT p50 | Host memory written |
+|---|---|---|---|---|---|---|
+| 0.5M tokens, 0.4x the GPU cache | none | 75.7% | | 7.459 | 0.139 s | |
+| 0.5M tokens, 0.4x the GPU cache | 32 GiB | 75.7% | 0% | 7.459 | 0.138 s | 98 GB in 120 s |
+| 1.4M tokens, 1.1x | 32 GiB | 0% | 0% | 3.614 | 4.76 s | 456 GB in 240 s |
+| 1.8M tokens, 1.4x | none | 0% | | 3.626 | 15.45 s | |
+| 1.8M tokens, 1.4x | 32 GiB | 0% | 0% | 3.676 | 15.25 s | 590 GB in 240 s |
+| 0.26M tokens, 3.2x a deliberately small 81,376-token cache | 32 GiB, 9x the cache | 0% | **79.0%** | 3.124 | 6.55 s | 257 GB in 240 s |
+
+Read the table as one ratio, not as a verdict on the feature. The host tier serves the same fraction the
+GPU cache would have served, 79% against 75.7%, when it is large against the working set (last row). It
+serves nothing when it is small against the working set: at 32 GiB against a 1.8M-token working set it was
+written 590 GB in four minutes, overwriting itself about seventeen times, so a conversation's blocks were
+gone from the host tier too by the time its next turn arrived. Between those two rows the end-to-end
+numbers move by 1.4% on requests per second and 1.3% on time to first token, inside the run-to-run band.
+
+Three things follow. **The wall is a ratio.** Size a tier against the working set you expect to reuse and
+against how long reuse takes to come back, not against HBM. **It is not free when it does nothing.** In the
+shape that already fits HBM the numbers are identical to three decimals and 98 GB still crossed the bus,
+because the store path runs on eviction whether or not anything will read it back. **It is node-local.**
+Each engine creates its buffer as a file in its own container (`/dev/shm/vllm_offload_<engine-id>.mmap`),
+so a request routed to a different replica cannot see it: this does nothing for the routing problem above,
+and the fix for that is either the cookie or a store the fleet shares. vLLM 0.28.0 can reach shared stores
+without patching (its connector registry includes LMCache, Mooncake, FlexKV, HF3FS and NIXL), which needs
+the client library in the image and a backend inside the VPC; not measured here.
+
+Two traps, both of which refused to start the engine. The tier is allocated in `/dev/shm`, so the
+container's shared memory must exceed it; this stack sizes `/dev/shm` at half the container's memory for
+that reason. And pinning the cache small to test a tier (`--kv-cache-memory-bytes`) is refused unless one
+request at `maxModelLen` fits in what is left, so cap `maxModelLen` in the same change.
+
 ### `maxModelLen: 0` (the model's own maximum)
 
 Maximum tokens per request, input plus output.
@@ -2005,6 +2046,7 @@ between sections are stated where they matter; the campaigns behind them:
 | Repeatability across regions and days, long prompts to 64k, KV precision by context length, structured output, the 8B and 32B dense points, the 80B hybrid MoE on one GPU and at TP=2 with its MTP head, quality on two tasks for eleven configurations | one `g7e.2xlarge` in three regions, one `p5.48xlarge` | 30B MoE, 8B, 27B, 32B dense, 80B hybrid MoE, 120B MXFP4 | streamed, 90 s levels, 1 to 256 in flight; lm-eval gsm8k 500 and ifeval 541 |
 | Output quality of every precision against its own bf16 (*What quantisation costs in answers*) | one `g7e.2xlarge` or `g7e.8xlarge` in four regions | 30B MoE (two releases), 8B, 27B, 32B dense, Mistral Small 3.2 24B; bf16, fp8, NVFP4, GPTQ, AWQ, fp8 KV | lm-eval 0.4.13 standard suite: MMLU 2,850, five log-likelihood tasks at 500, WikiText 60 docs, GSM8K 500, IFEval 541; ~40 min per configuration |
 | Agentic quality of every precision (*What quantisation costs an agent*, *Tool calling*) | 4 × `g7e.2xlarge` in two regions, 2 × `g7e.8xlarge` in a third | Qwen3-Coder-30B-A3B, Qwen3-32B, Qwen3-30B-A3B-2507 in bf16, fp8, AWQ, NVFP4; gpt-oss-120b | BFCL v4 single and multi-turn (4,441), τ-bench retail and airline (164 tasks, 2 trials), SWE-bench Verified first 100 with mini-swe-agent, CoNLL-2003 extraction 1,000 sentences in three JSON modes; one bf16 configuration repeated for the noise floor; 1.5 to 4 h per configuration |
+| KV cache offload to host memory (*Offloading the cache to host memory moves the capacity wall*) | one `g7e.4xlarge` (128 GiB host RAM) in eu-west-2 | 30B MoE fp8 | six-turn conversations of 8,000 tokens, streamed, 120 to 240 s per level, 32 to 224 conversations in flight; host tier 0 or 32 GiB; one run with the GPU cache pinned to 81,376 tokens |
 
 Run-to-run noise, measured by repeating configurations: an eight-engine H100 host reproduced every row
 within ±2% back to back and across two days and two regions; a single g7e engine within ±3 to 4%
@@ -2021,7 +2063,7 @@ Considered and left out, each with the condition that would bring it back:
 |---|---|---|
 | A prefix-aware router (a scheduler that knows which engine holds which prefix and each queue depth) | The load balancer plus `stickySessions` recovers most of the multi-turn gain (21% to 75% hit rate) with no new component | conversations span clients that cannot keep a cookie, or one upstream client fans out on behalf of many users |
 | Prefill and decode on separate engines (disaggregated serving) | Homogeneous single-GPU engines with a moderate prompt:answer ratio; the KV transfer between engines over PCIe would cost more than it saves | prompts grow past several thousand tokens with strict time-to-first-token targets, or the model needs TP>1 anyway |
-| KV cache offload to host memory or a shared store | The cache on one 96 GiB card held every load measured; the hit-rate problem was routing, not capacity | contexts of tens of thousands of tokens with reuse across engines |
+| A shared KV store across engines (LMCache, Mooncake, NIXL) | Host-memory offload is measured and is node-local (*Offloading the cache to host memory moves the capacity wall*); a shared store needs the client library in the image and a backend in the VPC | conversations or documents are reused across replicas and the cookie cannot pin them |
 | Multi-instance GPU (four 24 GB slices per card) | A 30B fp8 model needs the whole card | a model under 20 GB with strict per-tenant isolation |
 | Pipeline parallelism, multi-node engines | Every model measured fits one instance | a model over 640 GB in fp8 |
 | Another engine (TensorRT-LLM, SGLang) | One engine, measured deeply, beats two measured shallowly for a sample | a kernel gap on a GPU generation this engine does not serve well |

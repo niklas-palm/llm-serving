@@ -1381,3 +1381,16 @@ def test_the_measured_thresholds_and_timeouts_are_the_ones_deployed():
     assert (slow["Threshold"], slow["EvaluationPeriods"]) == (8, 3)
     roles = [r["Properties"] for r in t["Resources"].values() if r["Type"] == "AWS::IAM::Role"]
     assert any("AmazonSSMManagedInstanceCore" in json.dumps(r.get("ManagedPolicyArns", [])) for r in roles)
+
+
+def test_dev_shm_is_half_the_container_memory_with_an_8_gib_floor():
+    """A fixed 8 GiB /dev/shm refused to start the engine with a CPU KV offload buffer configured:
+    `Insufficient space in /dev/shm: 32768 MiB required, 8192 MiB free`. vLLM puts both the
+    tensor-parallel broadcast buffers and the offload region there, so it follows the container's memory."""
+    lp = [r["Properties"] for r in synth(instanceType="g7e.4xlarge")["Resources"].values()
+          if r["Type"] == "AWS::ECS::TaskDefinition"][0]["ContainerDefinitions"]
+    vllm = next(c for c in lp if c["Name"] == "vllm")
+    assert vllm["Memory"] == 78643 and vllm["LinuxParameters"]["SharedMemorySize"] == 39321
+    small = [r["Properties"] for r in synth(instanceType="g7e.2xlarge")["Resources"].values()
+             if r["Type"] == "AWS::ECS::TaskDefinition"][0]["ContainerDefinitions"]
+    assert next(c for c in small if c["Name"] == "vllm")["LinuxParameters"]["SharedMemorySize"] == 19660
