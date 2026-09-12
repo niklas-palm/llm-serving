@@ -1151,6 +1151,11 @@ and the fix for that is either the cookie or a store the fleet shares. vLLM 0.28
 without patching (its connector registry includes LMCache, Mooncake, FlexKV, HF3FS and NIXL), which needs
 the client library in the image and a backend inside the VPC; not measured here.
 
+The tier reports itself: `vllm:external_prefix_cache_queries_total` and `vllm:external_prefix_cache_hits_total`
+are the tokens looked up in and served from it, `vllm:kv_offload_total_bytes_total` is what it cost the bus.
+The dashboard does not scrape them (*Engine metrics*, and custom metrics are billed per name); read them from
+`/metrics` through the endpoint during a representative hour before deciding the tier earns its place.
+
 Two traps, both of which refused to start the engine. The tier is allocated in `/dev/shm`, so the
 container's shared memory must exceed it; this stack sizes `/dev/shm` at half the container's memory for
 that reason. And pinning the cache small to test a tier (`--kv-cache-memory-bytes`) is refused unless one
@@ -1290,6 +1295,14 @@ It is the standard first suggestion when an engine will not start, and it does f
 measuring or serving.
 
 `validate_tuning` rejects `enforceEager: true` outright with this number attached.
+
+### A host-memory KV tier smaller than the working set: measured **0 hits**, 590 GB of bus traffic
+
+`--kv-offloading-size 32` behind a 58 GiB GPU cache, with 1.4x the cache in conversations in flight: every
+block was overwritten in the tier before its conversation returned, throughput and time to first token
+within 1.5% of no tier, and 590 GB crossed PCIe in four minutes. The same tier served 79% of prompt tokens
+when it was nine times the cache. Size it against the working set that comes back or leave it off
+(*Offloading the cache to host memory moves the capacity wall* above).
 
 ### N-gram speculative decoding: measured **−58%**
 
