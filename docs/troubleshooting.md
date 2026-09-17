@@ -156,7 +156,7 @@ aws cloudformation describe-stacks --stack-name GpuLlmServing --region "$REGION"
 ```
 
 A stack update that touches the service waits silently for it to stabilise. CloudFormation waits for
-its own timeout, up to three hours; the stack is locked until then. Two things stop it stabilising.
+its own timeout, up to three hours; the stack is locked until then. Three things stop it stabilising.
 
 **Cause A: capacity was changed while a deploy was still waiting.** Scaling the ASG to zero or changing
 the instance type during that wait leaves nothing to place tasks on.
@@ -175,7 +175,27 @@ block-quantised FP8 checkpoint at a tensor-parallel degree that does not divide 
 whole tiles; drop the degree or enable expert parallelism, see [tuning.md](tuning.md)), and the
 `maxModelLen` startup failure on a nearly full card.
 
-**Fix: cancel the update, let it roll back, then retry.**
+**Cause C: a phantom task from the previous task-definition revision.** The engine is healthy, the
+target is healthy, and the update still does not finish. Seen on two of three occasions when a parked
+fleet (`instanceCount: 0`) was deployed with a new task definition and a count of 1: ECS started one
+task for the old revision the moment the count rose, and one for the new revision eight seconds later;
+the new one got the instance's only GPU and served, the old one stayed in `PROVISIONING` inside a
+deployment that was already complete. A completed deployment with `desiredCount` 0 and `pendingCount`
+1 is the sign:
+
+```bash
+aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --region "$REGION" \
+  --query 'services[0].deployments[].[status,taskDefinition,desiredCount,runningCount,pendingCount]' --output text
+aws ecs list-tasks --cluster "$CLUSTER" --region "$REGION" --desired-status RUNNING --query 'taskArns' --output text
+aws ecs describe-tasks --cluster "$CLUSTER" --tasks <each arn> --region "$REGION" \
+  --query 'tasks[0].[taskDefinitionArn,lastStatus]' --output text      # one RUNNING, one PROVISIONING
+aws ecs stop-task --cluster "$CLUSTER" --task <the PROVISIONING one> --region "$REGION"
+```
+
+The update completed two minutes after the stop, with no rollback and no engine restart. Waiting also
+works: ECS gave up on such tasks after 35 to 55 minutes when a fleet was parked mid-deploy.
+
+**Fix for A and B: cancel the update, let it roll back, then retry.**
 
 ```bash
 aws cloudformation cancel-update-stack --stack-name GpuLlmServing --region "$REGION"
@@ -547,6 +567,51 @@ aws logs tail "$LOG_GROUP" --since 1h --region "$REGION" | grep -iE "kv.cache|gp
 
 `--kv-cache-memory`, which the engine suggests at startup, measured as a no-op and will not help. See
 [tuning.md](tuning.md).
+
+---
+
+## Symptom: the engine refuses to start with `max_tokens_per_mm_item (2496) is larger than max_num_batched_tokens`
+
+A multimodal model sizes its prefill chunk against the largest image it could receive, and refuses a
+`maxNumBatchedTokens` below that even when `--limit-mm-per-prompt` sets images and audio to 0 (Gemma 4:
+2,496 tokens). **Fix:** raise `maxNumBatchedTokens` above the number in the message; for the evaluation
+settings below that meant 3072 instead of 2048, with `gpuMemoryUtilization` at 0.75 to keep the same
+headroom for the logits buffer (a 262k vocabulary is 1.7x the buffer per token of a 152k one).
+
+---
+
+## Symptom: log-likelihood scores at chance while the chat scores are fine
+
+`scripts/quality.py` reports gsm8k and IFEval in the 90s and, from the same run, winogrande near 50%,
+hellaswag near 50% and a wikitext perplexity in the thousands. **Cause: the model needs a
+beginning-of-sequence token and nothing on the `/v1/completions` path adds one.** The chat template
+writes `<bos>` itself, so chat is fine; a completions request carries whatever the client sent, and the
+engine's own tokenisation of a text prompt follows the tokenizer's `add_bos_token` flag, which Gemma 4
+ships turned off. Measured on the 31B: the same 21-token sentence scored a perplexity of 14,931 without
+`<bos>` and 4.5 with it, and `The capital of France is` completed to `France is France is France is`
+without it and `Paris.` with it. Qwen has no BOS token and never shows this. **Fix:** `quality.py` now
+adds it for any tokenizer that has one; a client of `/v1/completions` must prepend `<bos>` (the text
+works as well as the token id) or use the chat endpoints.
+
+**Second cause, same symptom: the instruction-tuned model is out of distribution on raw text.** With
+`<bos>` in place, a 58-token paragraph of plain prose still read a perplexity of 654 on the Gemma 4 12B,
+8,923 on the 26B mixture-of-experts and 86 on the 31B, and 11.7, 17.8 and 18.7 when the same paragraph
+was placed as the model's own turn inside its chat template. The engine is faithful; the checkpoints
+expect the turn structure. **Fix:** `quality.py --chat-loglik` wraps the log-likelihood prompts in the
+chat template and skips wikitext, which has no turn to live in. Qwen's instruction-tuned models scored
+the same either way, so the flag is off by default; turn it on when a model's log-likelihood scores sit
+at chance while its chat scores are fine.
+
+---
+
+## Symptom: the engine crash-loops at start with `Cannot copy between CPU and CUDA tensors during CUDA graph capture`
+
+The traceback ends in `gemma4_mtp.py` `compute_logits`. **Cause:** Gemma 4's multi-token-prediction drafter
+(`--speculative-config '{"model": "google/gemma-4-...-it-assistant", ...}'`) is not CUDA-graph-safe in vLLM
+0.28.0, the release this project pins; 0.29.0 fixes it (its notes list "Gemma4 MTP under CUDA graphs").
+**Fix:** drop the speculative config on 0.28.0, or build the image from `vllm/vllm-openai:v0.29.0`
+(change the `FROM` line and `TAG` in `scripts/build_image.py` together); measured on the same model, 0.29.0
+served the plain configuration within ±3% of 0.28.0 at every level. Cancel the stuck stack update first.
 
 ---
 
