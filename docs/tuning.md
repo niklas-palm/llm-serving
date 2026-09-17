@@ -279,6 +279,22 @@ of its memory-bandwidth ceiling than at TP=1 and delivered less in absolute term
 If the model does not fit, quantizing to fp8 to get back to TP=1 is usually a better trade than adding
 GPUs. Spare GPUs get an independent engine each; see *Topology: replicas or tensor parallelism?*.
 
+**That rule was measured over PCIe. Over NVLink it holds only above the knee.** The same dense 31B in
+fp8 on eight H100s (NVLink), host-level concurrency, request rate relative to eight TP=1 engines:
+
+| Topology | 1 in flight (decode tok/s per request) | 64 in flight | 128 | 256 | 512 |
+|---|---|---|---|---|---|
+| 8 × TP=1 | 64 | 1.00 | 1.00 | 1.00 | 1.00 |
+| 4 × TP=2 | 97 | **+26%** | **+16%** | +6% | −9% |
+| 2 × TP=4 | 134 | **+34%** | **+26%** | −2% | −12% |
+
+A dense model streams its whole weight set every decode step; splitting it halves the bytes per GPU per
+step, and NVLink's all-reduce is cheap enough to keep most of that gain. Above about 32 requests per
+GPU the eight independent batches win it back, and on 4,000-token unique prompts at 512 in flight
+TP=4 costs 37%. So on an NVLink instance serving a dense model below the knee, TP=2 or TP=4 is faster,
+not only a way to fit; on a PCIe instance (the g7e, where TP=2 measured 0.1% on prefill) one engine per
+GPU stays right. The mixture-of-experts case was not measured on NVLink.
+
 The degree must be a power of two (1, 2, 4, 8) and must divide the model's attention head count.
 
 **Block-quantised FP8 checkpoints add a third constraint.** Their weights are quantised in 128×128
@@ -1330,8 +1346,18 @@ not on the 30B at TP=1: a property of that model and topology, not of the GPU. D
 did not depend on the cache precision anywhere. Quality: no measurable effect on gsm8k or ifeval
 (*What quantisation costs in answers*).
 
+**A second exception, with a mechanism: the cache precision can decide which attention kernel you get.**
+Gemma 4's global layers use 512-wide heads, and in vLLM 0.28.0 on H100s only the Triton attention kernel
+accepts an fp8 KV cache for them; with a bf16 cache FlashAttention is offered and chosen. Measured on
+eight H100s with the 31B in fp8 weights, `auto` against `fp8`: +8 to +15% on the reference shape, +9 to
++18% on long answers, +28 to +69% on 4,000-token unique prompts (14.4 against 8.5 req/s at 512 in
+flight), and identical decode per request at 1 to 32 in flight, with half the tokens in the cache. The
+log says which kernel ran (`Using ... attention backend out of potential backends: [...]`); when `fp8`
+narrows the list to Triton, `auto` is the faster setting. On the g7e the list is Triton either way for
+this family (FlashAttention 4 does not support the head size there), so its rows stand as measured.
+
 **On by default here.** It is a lossy store for cached attention state; to rule that out, set
-`kvCacheDtype: auto`.
+`kvCacheDtype: auto`, and do so when it buys a better attention kernel.
 
 ### CUDA graph mode: leave the engine default
 
