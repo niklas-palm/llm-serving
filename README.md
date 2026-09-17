@@ -776,8 +776,9 @@ repeatability across days and regions; agentic quality of every precision on
 BFCL, τ-bench, SWE-bench Verified and structured extraction, with the tool parser in the loop and a
 repeated baseline for the noise floor; a fourth family (Gemma 4: a 26B mixture-of-experts, a dense 31B and
 an encoder-free 12B) in bf16, fp8, NVFP4 and the publisher's quantisation-aware int4, with its thinking
-mode, its multi-token-prediction drafter, and the same engine on two releases. **Not measured:** autoscaling timings on fleets other than 6 → 8;
-eight engines on one g7e host (no capacity found); code quality of a base model over an API (the
+mode, its multi-token-prediction drafter, the same engine on two releases, and on eight H100s its KV
+precision by attention kernel and TP=1, 2 and 4 over NVLink. **Not measured:** autoscaling timings on fleets other than 6 → 8;
+eight engines on one g7e host and a single-GPU H100 instance (no capacity found for either); code quality of a base model over an API (the
 agentic runs score instruct models through an agent, which is the shape that works).
 
 ---

@@ -114,7 +114,10 @@ The catalog also knows `p5.4xlarge` and `p5.48xlarge` (H100 SXM, 80 GiB HBM3 at 
 GPUs) so the same stack can be measured on Hopper; every figure in this document is g7e unless a table
 says otherwise, and NVFP4 checkpoints do not run on an H100. Measured on eight of each with the same
 matrix (*Choosing a model to host*, point 10): the H100 is +26% on the fp8 mixture-of-experts and +124%
-on a dense bf16 model, at roughly 1.8× the spot price per GPU-hour.
+on a dense bf16 model, at roughly 1.8× the spot price per GPU-hour. On Gemma 4 the gap followed the
+kernel, not the spec sheet: its 26B mixture-of-experts ran within −13 to +12% per engine of the g7e (both
+GPUs on the Triton attention kernel), its dense 31B in fp8 +20 to +58% (a dense step streams all the
+weights, so bandwidth shows), at 2× the spot price per GPU-hour that day ($2.80 against $1.20 to $1.50).
 
 What makes one GPU faster than another for this work is not its count or its memory size. Three
 things are:
@@ -1352,6 +1355,9 @@ accepts an fp8 KV cache for them; with a bf16 cache FlashAttention is offered an
 eight H100s with the 31B in fp8 weights, `auto` against `fp8`: +8 to +15% on the reference shape, +9 to
 +18% on long answers, +28 to +69% on 4,000-token unique prompts (14.4 against 8.5 req/s at 512 in
 flight), and identical decode per request at 1 to 32 in flight, with half the tokens in the cache. The
+26B mixture-of-experts, same swap: −1 to +7% on the reference shape, +5 to +13% on long answers and
+mixed traffic, +17 to +46% on 4,000-token unique prompts (74.9 against 51.3 req/s at 512 in flight),
+−10 to 0% at 1 to 32 in flight: the same mechanism, with less of the step spent in attention. The
 log says which kernel ran (`Using ... attention backend out of potential backends: [...]`); when `fp8`
 narrows the list to Triton, `auto` is the faster setting. On the g7e the list is Triton either way for
 this family (FlashAttention 4 does not support the head size there), so its rows stand as measured.
@@ -1658,6 +1664,13 @@ A later engine release may move those rows; the ones above them will not move wi
     Two things the ratio does not show: a g7e fleet grows one GPU at a time and 4-bit checkpoints
     (+26 to 57% on this GPU) do not run on the H100, while p5 spot capacity was unavailable in every
     EU region tried. Buy the GPU for the wall you are at, and recompute with the day's prices.
+    Gemma 4 on the same host class ten days later ($22.5 per `p5.48xlarge`, $1.20 to $1.50 per
+    g7e.2xlarge, spot) says the kernel decides as much as the bandwidth: the 26B mixture-of-experts came
+    out within −13 to +12% per engine of the g7e, because both GPUs ran the Triton attention kernel for
+    its 512-wide heads (with a bf16 KV cache and FlashAttention the H100 led by 3 to 20% on unique
+    prompts and matched it cached); the dense 31B in fp8 was +20 to +58% (single-stream 62 against 38
+    tokens/s). Per dollar-hour the g7e won by about 2× on the mixture-of-experts and 1.3 to 1.6× on the
+    dense model at load. Qwen3-30B fp8, which gets FlashAttention on the H100, was +26% on the same day.
 11. **On a card the weights nearly fill, `maxModelLen` decides whether the engine starts.** The 30B in
     bf16 (57 GB) on an 80 GB H100 refused to start at the model's 262k default context: one maximum-
     length request needs 24 GiB of KV and 16 GiB were left. `maxModelLen: 32768` started it. The same
@@ -2221,10 +2234,12 @@ between sections are stated where they matter; the campaigns behind them:
 | Repeatability across regions and days, long prompts to 64k, KV precision by context length, structured output, the 8B and 32B dense points, the 80B hybrid MoE on one GPU and at TP=2 with its MTP head, quality on two tasks for eleven configurations | one `g7e.2xlarge` in three regions, one `p5.48xlarge` | 30B MoE, 8B, 27B, 32B dense, 80B hybrid MoE, 120B MXFP4 | streamed, 90 s levels, 1 to 256 in flight; lm-eval gsm8k 500 and ifeval 541 |
 | Output quality of every precision against its own bf16 (*What quantisation costs in answers*) | one `g7e.2xlarge` or `g7e.8xlarge` in four regions | 30B MoE (two releases), 8B, 27B, 32B dense, Mistral Small 3.2 24B; bf16, fp8, NVFP4, GPTQ, AWQ, fp8 KV | lm-eval 0.4.13 standard suite: MMLU 2,850, five log-likelihood tasks at 500, WikiText 60 docs, GSM8K 500, IFEval 541; ~40 min per configuration |
 | Agentic quality of every precision (*What quantisation costs an agent*, *Tool calling*) | 4 × `g7e.2xlarge` in two regions, 2 × `g7e.8xlarge` in a third | Qwen3-Coder-30B-A3B, Qwen3-32B, Qwen3-30B-A3B-2507 in bf16, fp8, AWQ, NVFP4; gpt-oss-120b | BFCL v4 single and multi-turn (4,441), τ-bench retail and airline (164 tasks, 2 trials), SWE-bench Verified first 100 with mini-swe-agent, CoNLL-2003 extraction 1,000 sentences in three JSON modes; one bf16 configuration repeated for the noise floor; 1.5 to 4 h per configuration |
+| Gemma 4 (*Choosing a model to host*, *Reasoning models*, *Speculative decoding*, *`kvCacheDtype: fp8`*, *Tensor parallelism*): fit, kernels, bf16, fp8, NVFP4, the publisher's int4, thinking, the MTP drafter on 0.29.0, quality; on H100s the KV precision by kernel, TP=1, 2 and 4 over NVLink, and the Qwen reference repeated | one `g7e.2xlarge` in three regions, one `p5.48xlarge` | Gemma 4 26B-A4B MoE, 31B dense, 12B encoder-free; Qwen3-30B-A3B-2507 fp8 | same matrix, 1 to 64 per engine and 64 to 512 per host; lm-eval log-likelihood tasks chat-wrapped, GSM8K 500, IFEval 541 |
 | KV cache offload to host memory (*Offloading the cache to host memory moves the capacity wall*) | one `g7e.4xlarge` (128 GiB host RAM) in eu-west-2 | 30B MoE fp8 | six-turn conversations of 8,000 tokens, streamed, 120 to 240 s per level, 32 to 224 conversations in flight; host tier 0 or 32 GiB; one run with the GPU cache pinned to 81,376 tokens |
 
 Run-to-run noise, measured by repeating configurations: an eight-engine H100 host reproduced every row
-within ±2% back to back and across two days and two regions; a single g7e engine within ±3 to 4%
+within ±2% back to back and across two days and two regions, and the same configuration on another
+spot instance ten days later within +0 to +3% on every shape and level; a single g7e engine within ±3 to 4%
 (cached shapes ±4%), and two regions' single-engine baselines matched within 4%. The p95 of time to
 first token moves ±25% between identical runs. A difference inside those bands is not a result.
 A later engine release moves the kernel choices named in *The evidence* and *troubleshooting.md*, and
