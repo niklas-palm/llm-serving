@@ -30,6 +30,23 @@ does not. Run the same command against two deployments and compare rows, or pass
 fraction of questions whose answer changed: a precision can keep the aggregate and still flip one
 answer in ten.
 
+A model trained with a beginning-of-sequence token needs it on the completions path too, and nothing there
+adds one: the harness tokenises without special tokens unless told to, and the engine's tokenisation of a
+text prompt follows the tokenizer's add_bos_token flag, which Gemma 4 ships turned off (its chat template
+writes <bos> itself, so chat scores are unaffected). Without it the 31B scored a perplexity of 14,931 on a
+21-token sentence against 4.5 with it, and every log-likelihood task read chance. This script therefore
+asks the harness to add <bos> whenever the tokenizer has one, and hands it a copy of the tokenizer with
+the flag on when the original would not comply. `--text-prompts` cannot do that: the engine tokenises,
+and for such a model the log-likelihood scores are meaningless in that mode.
+
+That was necessary and not sufficient for Gemma 4: its instruction-tuned checkpoints are out of
+distribution on raw text even after `<bos>`. A 58-token paragraph read a perplexity of 654 (12B), 8,923
+(26B MoE, fp8) and 86 (31B) as raw text, and 11.7, 17.8 and 18.7 when placed as the model's own turn
+inside its chat template; the raw completion of `The capital of France is` opened a thinking channel
+or produced gibberish. `--chat-loglik` wraps the log-likelihood prompts in the chat template (the
+harness's own support for it on this path) and skips wikitext, which has no turn to live in. Qwen's
+instruction-tuned models scored the same raw and wrapped, so it is off by default.
+
 Two things about the deployment under test. A thinking model must be served with thinking off for these
 settings (see docs/tuning.md), or the chain of thought eats the cap and every generative score
 collapses. And the log-likelihood requests ask the engine for the probability of every prompt token,
@@ -38,7 +55,12 @@ GiB per request. At the serving default of 0.95 memory utilisation the engine ha
 with a CUDA out-of-memory on the first batch, and 0.85 was not enough either: the logits buffer scales
 with the prefill chunk, not the request. Deploy the configuration you are scoring with
 `gpuMemoryUtilization: 0.80` and `maxNumBatchedTokens: 2048` for the duration of the evaluation
-(measured to hold at 4 in flight with 10-shot prompts); neither changes what is scored.
+(measured to hold at 4 in flight with 10-shot prompts); neither changes what is scored. Two models
+refused or needed more: a multimodal model sizes the chunk against its largest image (Gemma 4 refuses
+2048 with "max_tokens_per_mm_item (2496) is larger than max_num_batched_tokens" even with images
+limited to 0; 3072 at 0.75 held, its 262k vocabulary making the buffer 1.7x larger per token), and a
+bf16 model that fills the card cannot give up utilisation, so lower `maxModelLen` to a few thousand
+tokens instead (a 31B dense at 0.80 with `maxModelLen: 8192`).
 
 Do not compare with published numbers, which use other prompts and settings; compare deployments with
 each other.
@@ -99,10 +121,48 @@ def served_model(url: str, key: str) -> str:
     return models[0]
 
 
+def bos_arguments(tok, source: str) -> tuple[str, str]:
+    """The tokenizer to hand the harness for the log-likelihood pass, and the model arguments that make it send <bos>.
+
+    Returns the tokenizer path unchanged and no arguments for a tokenizer without a BOS id (Qwen). With one, the
+    harness gets add_bos_token=True, so it tokenises with add_special_tokens=True, and custom_prefix_token_id, the
+    start token of the rolling perplexity pass. A tokenizer that adds nothing even then (Gemma 4: add_bos_token
+    false in its config) is saved with the flag on and the copy is handed over instead; the reloaded copy emits
+    the BOS id first. Measured on the 31B: perplexity 14,931 without <bos>, 4.5 with it, on the same sentence.
+    """
+    bos = getattr(tok, "bos_token_id", None)
+    if bos is None:
+        return source, ""
+    extra = f",add_bos_token=True,custom_prefix_token_id={bos}"
+    if list(tok("x", add_special_tokens=True).input_ids[:1]) == [bos]:
+        return source, extra
+    tok.add_bos_token = True
+    path = tempfile.mkdtemp(prefix="tokenizer-bos-")
+    tok.save_pretrained(path)
+    return path, extra
+
+
+def loglik_tokenizer(a: argparse.Namespace, model: str) -> str:
+    """The `tokenized_requests=...` part of the harness arguments for log-likelihood tasks, computed once per run."""
+    if a.text_prompts:
+        return "tokenized_requests=False"
+    source = a.tokenizer or model
+    if a.chat_loglik:      # the chat template writes <bos> itself; adding another would double it
+        return f"tokenized_requests=True,tokenizer={source}"
+    from transformers import AutoTokenizer
+    path, bos = bos_arguments(AutoTokenizer.from_pretrained(source), source)
+    if bos and path != source:
+        print(f"tokenizer {source} does not add <bos> by itself; the harness gets a copy that does ({path})")
+    return f"tokenized_requests=True,tokenizer={path}{bos}"
+
+
 def harness(kind: str, tasks: str, extra: list[str], limit: int, a: argparse.Namespace, model: str, out: str) -> None:
+    if kind == "loglik" and a.chat_loglik and tasks == "wikitext":
+        print("\nskipping wikitext: rolling perplexity over raw text, which --chat-loglik exists to avoid", flush=True)
+        return
     if kind == "loglik":
-        tok = ("tokenized_requests=False" if a.text_prompts
-               else f"tokenized_requests=True,tokenizer={a.tokenizer or model}")
+        tok = a.loglik_tokenizer
+        extra = extra + (["--apply_chat_template"] if a.chat_loglik else [])
         model_args = (f"model={model},base_url={a.url}/v1/completions,num_concurrent={a.loglik_concurrency},"
                       f"max_retries=3,{tok},max_length=8192")
         cmd = ["lm_eval", "--model", "local-completions", "--model_args", model_args]
@@ -201,6 +261,9 @@ def main() -> int:
     ap.add_argument("--text-prompts", action="store_true",
                     help="send text instead of token ids for log-likelihood tasks: for models whose Hub tokenizer "
                          "does not match the engine's (Mistral tekken tokenizers), or that have no Hub tokenizer")
+    ap.add_argument("--chat-loglik", action="store_true",
+                    help="wrap the log-likelihood prompts in the chat template and skip wikitext: for instruction-tuned "
+                         "models that collapse on raw text (Gemma 4)")
     ap.add_argument("--concurrency", type=int, default=16, help="generative requests in flight")
     ap.add_argument("--loglik-concurrency", type=int, default=4,
                     help="log-likelihood requests in flight; each holds vocabulary x prompt logits on the GPU")
@@ -215,6 +278,8 @@ def main() -> int:
     out = a.output or tempfile.mkdtemp(prefix="quality-")
     model = served_model(a.url, a.key)
     print(f"model {model}, suite {a.suite}, output {out}")
+    if any(kind == "loglik" for kind, *_ in SUITES[a.suite]):
+        a.loglik_tokenizer = loglik_tokenizer(a, model)
     for kind, tasks, extra, limit in SUITES[a.suite]:
         harness(kind, tasks, extra, limit, a, model, out)
     summarise(out, a.tag or model, model, a.csv)

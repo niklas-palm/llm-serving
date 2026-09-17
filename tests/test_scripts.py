@@ -252,3 +252,50 @@ def test_extraction_reads_bio_tags_parses_leniently_and_scores_mentions():
     b = e.body("m", "IBM hired Ada .", [("x", gold)], "schema")
     assert b["response_format"]["json_schema"]["strict"] and b["messages"][-1]["content"] == "IBM hired Ada ." and len(b["messages"]) == 4
     assert "response_format" not in e.body("m", "x", [], "free")
+
+
+def test_quality_adds_bos_for_tokenizers_that_have_one_and_copies_those_that_will_not(tmp_path):
+    """Every Gemma 4 log-likelihood score sat at chance (wikitext perplexity 10,709, winogrande 52.8%) while the chat
+    scores were fine: the tokenizer ships add_bos_token false, so the harness sent BOS-less prompts and the model
+    scored a 21-token sentence at perplexity 14,931 instead of 4.5. Qwen has no BOS and must be left alone."""
+    from types import SimpleNamespace
+    q = _load("quality")
+
+    class Tok:
+        def __init__(self, bos, adds):
+            self.bos_token_id, self.add_bos_token, self.saved = bos, adds, None
+
+        def __call__(self, text, add_special_tokens=False):
+            ids = [7, 8]
+            return SimpleNamespace(input_ids=([self.bos_token_id] + ids) if add_special_tokens and self.add_bos_token else ids)
+
+        def save_pretrained(self, path):
+            self.saved = path
+
+    assert q.bos_arguments(Tok(None, False), "Qwen/x") == ("Qwen/x", ""), "no BOS id: nothing to add"
+    assert q.bos_arguments(Tok(1, True), "meta/x") == ("meta/x", ",add_bos_token=True,custom_prefix_token_id=1"), \
+        "adds BOS by itself: the harness only has to ask"
+    gemma = Tok(2, False)
+    path, extra = q.bos_arguments(gemma, "google/x")
+    assert extra == ",add_bos_token=True,custom_prefix_token_id=2"
+    assert path != "google/x" and gemma.saved == path and gemma.add_bos_token is True, "a copy with the flag on is handed over"
+
+
+def test_quality_chat_loglik_wraps_prompts_in_the_chat_template_and_skips_wikitext(monkeypatch, tmp_path):
+    """Gemma 4's instruction-tuned checkpoints read perplexity 654 to 8,923 on a plain paragraph after <bos> and 12 to
+    19 on the same paragraph inside their chat turn, so raw log-likelihood prompts measured nothing. wikitext has no
+    turn structure and is skipped rather than reported."""
+    import subprocess
+    from types import SimpleNamespace
+    q = _load("quality")
+    calls = []
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: calls.append(cmd) or SimpleNamespace(returncode=0))
+    a = SimpleNamespace(chat_loglik=True, loglik_tokenizer="tokenized_requests=True,tokenizer=m", url="https://e", key="k",
+                        loglik_concurrency=4, concurrency=16, text_prompts=False, tokenizer="")
+    q.harness("loglik", "wikitext", [], 60, a, "m", str(tmp_path))
+    q.harness("loglik", "arc_challenge", ["--num_fewshot", "25"], 500, a, "m", str(tmp_path))
+    q.harness("gen", "gsm8k", ["--num_fewshot", "5"], 500, a, "m", str(tmp_path))
+    assert len(calls) == 2, "wikitext was skipped"
+    assert "--apply_chat_template" in calls[0] and "--num_fewshot" in calls[0], "the multiple-choice pass is wrapped"
+    assert calls[1].count("--apply_chat_template") == 1, "the generative pass was already wrapped and is not doubled"
+    assert q.loglik_tokenizer(a, "m") == "tokenized_requests=True,tokenizer=m", "no BOS copy: the template writes <bos>"
