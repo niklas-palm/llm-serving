@@ -4,8 +4,8 @@ Deploy an open-weight LLM with [vLLM](https://github.com/vllm-project/vllm) on A
 a load balancer, with an OpenAI-compatible API.
 
 Any model vLLM serves: `modelId` is a Hugging Face repo id, and the stack derives the GPUs per engine
-from the model's size. It has served ten models from 8B to 235B, dense, mixture-of-experts and
-hybrid, in bf16, fp8 and four 4-bit formats, on one GPU and on eight; the table in [Configure](#configure)
+from the model's size. It has served thirteen models from 8B to 235B, dense, mixture-of-experts and
+hybrid, in bf16, fp8 and five 4-bit formats, on one GPU and on eight; the table in [Configure](#configure)
 lists them with the one or two settings each needed beyond `modelId`. The shipped default is one of
 them, chosen because it fits one GPU with room for a large cache.
 
@@ -199,6 +199,9 @@ measured default. Sizes are the checkpoint's, GPUs are per engine:
 | `openai/gpt-oss-120b` | MoE, MXFP4 | 1 | MXFP4 (the only build) | `toolCallParser: openai`, `reasoningParser: openai_gptoss`, `kvCacheDtype: auto`; `estimatedParamsBillions: 120` |
 | `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4` | hybrid MoE, NVFP4 | 1 | NVFP4 | `extraEnv: {VLLM_USE_FLASHINFER_MOE_FP4: "0", VLLM_NVFP4_GEMM_BACKEND: marlin}` and `gpuMemoryUtilization: 0.90` for a stable start |
 | `Qwen/Qwen3-235B-A22B-Instruct-2507` | MoE, 22B active | 4 or 8 (H100) | publisher fp8 (block-quantised), bf16 | fp8: `tensorParallel: 4` and two engines per host, or 8 with `enableExpertParallel` (block-quantised weights refuse TP=8 without it); bf16: TP=8 with `maxModelLen: 32768` |
+| `google/gemma-4-26B-A4B-it` | MoE, 3.8B active, hybrid sliding/global attention | 1 | bf16, Red Hat fp8, NVIDIA NVFP4 | `toolCallParser: gemma4` and `reasoningParser: gemma4`, the second even with thinking off (*Tool calling*); Apache-2.0, no token needed |
+| `google/gemma-4-31B-it` | dense, hybrid attention | 1 | bf16, Red Hat fp8, Google QAT W4A16, NVIDIA NVFP4 | as above; in bf16 also `maxModelLen: 131072`: its 262k context does not fit next to 62 GB of weights on a 96 GB card (*Will my model fit?*) |
+| `google/gemma-4-12B-it` | dense, encoder-free multimodal | 1 | bf16, Red Hat fp8, Google QAT W4A16 | as above |
 
 Formats, kernels and what each one costs in throughput and in answers are in *Choosing a model to host*,
 *Quantisation is two independent decisions* and the two quality sections of
@@ -225,7 +228,7 @@ decoding with EAGLE-3* in [docs/tuning.md](docs/tuning.md).
 
 | If | Set | Because |
 |---|---|---|
-| anything but a plain chat client will call it (an agent framework, a coding agent, your own tool-calling harness) | `toolCallParser` to the model family's parser (`hermes` for Qwen3, `qwen3_coder`, `openai` for gpt-oss, `llama3_json`, `mistral`) | without it a request with `tools` gets the tool call back as text and the agent stalls silently (*Tool calling*) |
+| anything but a plain chat client will call it (an agent framework, a coding agent, your own tool-calling harness) | `toolCallParser` to the model family's parser (`hermes` for Qwen3, `qwen3_coder`, `openai` for gpt-oss, `gemma4` for Gemma 4, `llama3_json`, `mistral`) | without it a request with `tools` gets the tool call back as text and the agent stalls silently (*Tool calling*) |
 | the model thinks (Qwen3 thinking builds, gpt-oss) | thinking off through `extraArgs: --default-chat-template-kwargs '{"enable_thinking": false}'`, or `reasoningParser` when you want the chain of thought separated from the answer | the chain of thought is the capacity setting: 1.7 to 3.5 times the tokens per answer, and it eats every answer cap (*Reasoning models*) |
 | traffic is multi-turn conversations and each client keeps its own cookies | `stickySessions: true` | the prefix cache is per engine; round robin hit it 21% of the time on eight engines, stickiness 75% (*Prefix caching is a routing decision*). Leave it off behind a gateway: the cookie pins a client's cookie jar, and a gateway is one client, so it would pin all traffic to one engine unless it replays the cookie per end-user session |
 
@@ -393,7 +396,8 @@ A failed build prints the failing phase and the log location. To check later:
 
 ### 2. Gated model? Add your Hugging Face token (optional)
 
-Public models need nothing here. For a gated one (Llama, Gemma, anything you had to click "agree" for),
+Public models need nothing here. For a gated one (Llama, Gemma 3, anything you had to click "agree" for;
+Gemma 4 is Apache-2.0 and not gated),
 put your Hugging Face token in Secrets Manager once and name the secret in your config. The engine reads
 it as `HF_TOKEN`; the token never enters the template, the outputs or the logs.
 
@@ -770,7 +774,9 @@ round-robin and sticky routing; prompts to 64,000 tokens, unique and cached, on 
 output; reasoning effort; KV cache offload to host memory against the GPU cache it extends;
 repeatability across days and regions; agentic quality of every precision on
 BFCL, τ-bench, SWE-bench Verified and structured extraction, with the tool parser in the loop and a
-repeated baseline for the noise floor. **Not measured:** autoscaling timings on fleets other than 6 → 8;
+repeated baseline for the noise floor; a fourth family (Gemma 4: a 26B mixture-of-experts, a dense 31B and
+an encoder-free 12B) in bf16, fp8, NVFP4 and the publisher's quantisation-aware int4, with its thinking
+mode, its multi-token-prediction drafter, and the same engine on two releases. **Not measured:** autoscaling timings on fleets other than 6 → 8;
 eight engines on one g7e host (no capacity found); code quality of a base model over an API (the
 agentic runs score instruct models through an agent, which is the shape that works).
 

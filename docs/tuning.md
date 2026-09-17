@@ -92,6 +92,14 @@ The symptoms below point at it; *Interpreting your own measurements* has the one
 | What helps | fewer input tokens (cache, shorter context), a faster GPU, fp8/NVFP4 | fewer bytes per token (quantisation, MoE), speculative decoding, fewer requests per GPU |
 | What does not | batch-size knobs | prefix caching, prompt trimming |
 
+The prefill wall has a number. On this GPU, measured with 4,000-token prompts at 16 to 64 in flight on one
+engine, prefill saturated at 27,000 tok/s for a 3.8B-active mixture-of-experts in bf16, 45,000 for the same
+weights in fp8, 11,700 for a dense 12B in bf16, 4,300 for a dense 31B in bf16 and 8,100 for it in fp8, and
+about 36,000 for a 3.3B-active mixture-of-experts in fp8. Multiply each by twice its activated parameters
+and the same figure comes out: 200 to 280 TFLOPS in bf16, 340 to 500 in fp8. So before measuring, expect
+prefill tok/s of about 250e12 / (2 × active parameters) at bf16 and roughly twice that at fp8, on this card,
+whatever the architecture; a model that lands far below it is on a slow kernel (*Choosing a model to host*).
+
 Read it off the dashboard: *How long does a request take inside the engine?* shows time to first token
 against the whole request, and *Is the prefix cache paying off?* says whether hits are even possible.
 Short prompts with long answers on a dense model are decode-bound; long documents through a
@@ -243,6 +251,17 @@ proportional because activation peaks and CUDA graphs are roughly constant in ab
 
 One 96 GiB GPU holds a 30B model in bf16, or a 70B in fp8.
 
+**The weights are not the only fixed cost.** The engine refuses to start unless the cache left after the
+weights holds one request at `maxModelLen`, and that cost is the model's KV bytes per token times its
+context length, which the model card does not print and which varies 6x between architectures. Measured
+on this card with vLLM 0.28.0: a dense 31B with hybrid attention (60 layers, 16 local KV heads of 256, 4
+global KV heads of 512, 262,144 context) needed **33.3 GiB for one 262,144-token request**; its 62.5 GB
+of bf16 weights left 29.2 GiB, so it did not start until `maxModelLen: 131072`, and then held 164,056
+tokens of cache (186 KiB per token counting every layer; 1.25 requests of full length). The same
+family's 26B mixture-of-experts (30 layers, 8 and 2 KV heads) costs 33 KiB per token and started with
+39 GiB to spare, 1.23M tokens. The engine prints the two numbers it compared; the fix is the one in
+*`maxModelLen`* below, or quantised weights, which for the 31B leave room for the full context.
+
 ---
 
 ## Tensor parallelism: a way to make a model fit, not a way to go faster
@@ -365,7 +384,12 @@ same harness through the endpoint (`scripts/quality.py`: lm-evaluation-harness 0
 checkpoints are published with). Log-likelihood tasks over `/v1/completions`: MMLU 5-shot (50 per subject,
 2,850), ARC-Challenge 25-shot, HellaSwag 10-shot, Winogrande 5-shot, TruthfulQA mc2 (500 each), and
 WikiText word perplexity (60 documents). Generative tasks over chat completions, greedy, 1,024-token cap:
-GSM8K 5-shot (500) and IFEval (541). Thinking models were served with thinking off. One standard error is
+GSM8K 5-shot (500) and IFEval (541). Thinking models were served with thinking off, and the harness sends the
+model's beginning-of-sequence token on the completions path when it has one (Gemma 4's tokenizer adds
+none by itself). Gemma 4's instruction-tuned checkpoints are out of distribution on raw text even then
+(a plain paragraph read perplexity 654 to 8,923 raw and 12 to 19 inside their chat turn), so their
+log-likelihood tasks were run with the chat template and without wikitext (`quality.py --chat-loglik`;
+troubleshooting, *log-likelihood scores at chance*). One standard error is
 about 0.7 points on MMLU, 2 on the other tasks, 1.1 to 1.9 on GSM8K, 1.6 on IFEval. Each row below is one
 served configuration on one 96 GB GPU; deltas are against the family's bf16 row.
 
@@ -408,6 +432,34 @@ served configuration on one 96 GB GPU; deltas are against the family's bf16 row.
 |---|---|---|---|---|---|---|---|---|---|
 | publisher fp8, fp8 KV | +0.1 | 0.0 | +0.2 | −0.6 | +0.3 | −0.6 | −0.9 | +0.4% | 2 to 4% |
 | community NVFP4 | −1.1 | +0.6 | +1.6 | +1.4 | −0.6 | 0.0 | +0.4 | +1.9% | 4 to 6% |
+
+**Gemma 4 26B-A4B (mixture of experts, 3.8B active; a sixth family, scored with chat-templated multiple choice, no perplexity), bf16 = MMLU 84.2, ARC 70.8, HellaSwag 62.4, Winogrande 70.2, TruthfulQA 62.9, GSM8K 93.8, IFEval 87.1**
+
+| Served as | MMLU | ARC | HellaSwag | Winogrande | TruthfulQA | GSM8K | IFEval | Answers flipped |
+|---|---|---|---|---|---|---|---|---|
+| Red Hat fp8, fp8 KV | +0.1 | −1.2 | −0.6 | +0.6 | +1.1 | 0.0 | +1.8 | 2 to 5% |
+| NVIDIA NVFP4 (calibrated) | −0.4 | −2.0 | −0.6 | +3.4 | +0.6 | −0.2 | +1.5 | 3 to 6% |
+
+**Gemma 4 31B (dense; chat-templated multiple choice, no perplexity), bf16 = MMLU 87.6, ARC 68.8, HellaSwag 62.0, Winogrande 75.8, TruthfulQA 64.0, GSM8K 96.0, IFEval 90.0**
+
+| Served as | MMLU | ARC | HellaSwag | Winogrande | TruthfulQA | GSM8K | IFEval | Answers flipped |
+|---|---|---|---|---|---|---|---|---|
+| Red Hat fp8, fp8 KV | +0.1 | 0.0 | 0.0 | −0.8 | −0.4 | −0.4 | +0.2 | 1 to 6% |
+| Google QAT W4A16 (the publisher's own quantisation-aware int4) | −0.6 | −1.2 | +2.6 | −0.2 | −0.8 | −0.2 | +0.6 | 1 to 8% |
+| NVIDIA NVFP4 (calibrated) | −0.1 | −1.6 | −0.2 | −1.0 | −1.5 | +0.8 | +0.2 | 2 to 7% |
+
+**Gemma 4 12B (dense, encoder-free), bf16 = MMLU 80.1, ARC 64.8, HellaSwag 62.6, Winogrande 72.2, TruthfulQA 61.6, GSM8K 92.4, IFEval 86.9**
+
+| Served as | MMLU | ARC | HellaSwag | Winogrande | TruthfulQA | GSM8K | IFEval | Answers flipped |
+|---|---|---|---|---|---|---|---|---|
+| Red Hat fp8, fp8 KV | −0.4 | +2.0 | +0.4 | −1.2 | −1.0 | −1.4 | +1.1 | 3 to 5% |
+| Google QAT W4A16 (the publisher's own quantisation-aware int4) | −1.0 | −1.6 | +1.0 | 0.0 | −2.7 | −1.8 | −0.2 | 7 to 9% |
+
+The Gemma rows are not comparable with the Qwen rows in absolute terms (chat-wrapped prompts score lower on
+HellaSwag and higher on MMLU than raw ones); the deltas against their own bf16 are like for like, and they
+say what every family before them said: fp8 within noise with balanced flips, 4-bit 0.5 to 2 points down on
+the knowledge and math tasks with one answer in twelve to twenty flipped. Google's quantisation-aware int4
+bought the same 4-bit as everyone else's calibration, not a free one.
 
 **Mistral Small 3.2 24B (dense, a second model family), a partial check.** Its tokenizer is not the Hub
 tokenizer, so the harness had to send text instead of token ids, and the official bf16 checkpoint in the
@@ -637,6 +689,27 @@ convenience of fp8 has no NVFP4 equivalent.
 133,463 input tok/s, 22,244 per instance against 14,903 for the shipped FP8, **+49% per GPU**, p95
 4.54 s against 6.33 s. Acceptance length fell from 2.2 to 1.95, since the speculator was trained against
 the bf16 model, and it still added 17% on top of NVFP4 alone.
+
+#### 4-bit is two different products on this GPU: native FP4 compute, or weight-only dequantisation
+
+Measured on Gemma 4 with the same matrix on one engine, each 4-bit build against its own family's fp8:
+
+| Model and build | Kernel the log named | 1 in flight decode tok/s | 8 in flight (unique, cached) | 64 in flight unique | 64 cached | Prefill wall (4k prompts) |
+|---|---|---|---|---|---|---|
+| 26B MoE, NVIDIA NVFP4 | FlashInfer CUTLASS NvFp4 MoE | 159 vs 186 (−15%) | 0%, −13% | +8% | 0% | 46.9k vs 45.9k tok/s (+2%) |
+| 12B dense, Google QAT W4A16 | Marlin (compressed-tensors WNA16) | 132 vs 89 (+48%) | +21%, +26% | −26% | −47% | 12.0k vs 21.4k tok/s (−44%) |
+| 31B dense, Google QAT W4A16 | Marlin | 62 vs 39 (+58%) | +23%, +55% | −30% | +20% | 3.9k vs 8.0k tok/s (−52%); 4k unique prompts at 64 in flight 0.20 vs 1.06 req/s |
+| 31B dense, NVIDIA NVFP4 | FlashInfer CUTLASS NvFp4 GEMM | 41 vs 39 (+4%) | +8%, 0% | +13% | +8% | 8.6k vs 8.0k tok/s (+8%) |
+
+A weight-only kernel unpacks int4 to bf16 and runs the matmul at the bf16 rate, so it wins exactly where
+the wall is memory bandwidth (few requests in flight, long answers, cached prefixes) and gives the fp8
+prefill gain back where the wall is compute (many unique prompts). Native FP4 keeps the fp8 compute rate
+and cuts bytes; on the 26B's 704-wide experts that bought almost nothing over fp8, and Google does not
+publish a 4-bit build of that model for quality reasons. So pick a 4-bit checkpoint by the wall you are at
+(*Which wall are you at?*) and the kernel the startup log names, not by the bit count: an interactive
+fleet at low concurrency is the W4A16 case; a batch or long-document fleet is not. What the two paths
+cost in answers was the same: 0.5 to 2 points and one answer in twelve to twenty (*What quantisation
+costs in answers*).
 
 #### AWQ 4-bit: measured fastest, quality unvalidated
 
@@ -958,6 +1031,25 @@ fleet sized for low-effort traffic serves a third of the requests when clients a
 harness has to see the answer, too: with the cap below the model's chain of thought, answers never
 leave the reasoning channel and score as empty (*What quantisation costs in answers*).
 
+The same law on a second family with a thinking switch rather than an effort setting. Gemma 4 thinks when
+the request (or `--default-chat-template-kwargs '{"enable_thinking": true}'`) asks; measured on one engine
+with 1,000-token prompts, answers left to run to their end under a 2,000-token cap:
+
+| Model | Thinking off: tokens per answer, req/s at 8 and 32 | Thinking on | Decode tok/s per request, off / on |
+|---|---|---|---|
+| 26B MoE, fp8 | 265, 2.83 and 6.66 | 1,017, 0.72 and 1.72 | 100 / 102 at 8, 60 / 65 at 32 |
+| 12B dense, fp8 | 241, 2.36 and 6.49 | 910, 0.63 and 1.68 | 75 / 80, 50 / 60 |
+| 31B dense, fp8 | 350, 0.68 and 1.86 | 939, 0.25 and 0.55 | 34 / 35, 24 / 27 |
+
+3.8× the tokens per answer on the two smaller models, 2.7× on the 31B, which already writes longer answers;
+the request rate falls by the same factor and decode per request does not move. Time to first token did not
+move either. With a 190-token cap and thinking on, the request rate read the same as with thinking off,
+because every answer was cut off inside the thought: `content` empty, the reasoning truncated. A fleet with a
+small `max_tokens` and thinking on looks healthy on every throughput graph and answers nothing; size the cap
+for the chain of thought (about 1,000 tokens here) or turn thinking off per request
+(`chat_template_kwargs: {"enable_thinking": false}`) or by default. The tool-call turn is affected too: the
+same `get_weather` call cost 23 output tokens with thinking off and 104 to 130 with it on.
+
 ---
 
 ## Tool calling: the parser is part of the deployment
@@ -969,9 +1061,13 @@ parser for that format to turn the text into the field. Without one, a request t
 the model's tool-call text back as plain `content`, no client library recognises it, and the agent stalls
 on its first step with no error anywhere. `toolCallParser` in `config.yaml` is that one flag, per model
 family: `hermes` for Qwen3 and Qwen3-30B-A3B, `qwen3_coder` for Qwen3-Coder, `openai` for gpt-oss,
-`llama3_json` for Llama 3.x, `mistral` for Mistral; `vllm serve --help` lists them all. For a thinking
-model served with thinking on, `reasoningParser` (`qwen3`, `openai_gptoss`, `deepseek_r1`) moves the chain
-of thought into `reasoning_content` so the client gets the answer; with thinking off it is not needed.
+`gemma4` for Gemma 4, `llama3_json` for Llama 3.x, `mistral` for Mistral; `vllm serve --help` lists them all. For a thinking
+model served with thinking on, `reasoningParser` (`qwen3`, `openai_gptoss`, `gemma4`, `deepseek_r1`) moves the chain
+of thought into `reasoning_content` so the client gets the answer; with thinking off it is not needed, with one
+measured exception: Gemma 4 emits an empty `<|channel>thought\n<channel|>` block after a tool-result turn
+even with thinking off, and without `reasoningParser: gemma4` those tokens arrived in `content` (a plain
+question came back clean). With thinking requested and no parser, the answer was 1,336 tokens of nothing:
+empty `content`, no reasoning field. For that family the two parsers are one setting.
 
 Three things measured while scoring agents through this stack (*What quantisation costs an agent*):
 
@@ -1394,6 +1490,32 @@ trusting it on a tensor-parallel one. The "speculation loses at load" rule of th
 not apply here: a 3B-active model leaves compute to spare for verification. Judge any speculation by request rate and per-request decode on your traffic, never
 by the acceptance rate the log prints, which was the same in both rows.
 
+**A publisher's MTP drafter on a dense model was the largest gain measured, and it needs vLLM 0.29.0.**
+Google ships a four-layer draft model for each Gemma 4 size (`google/gemma-4-<size>-it-assistant`); it
+shares the target's KV cache and costs 2.7 GiB of it. On vLLM 0.28.0, the release this project pins, it
+crash-loops at start (`Cannot copy between CPU and CUDA tensors during CUDA graph capture` in
+`gemma4_mtp.py`; troubleshooting has the entry); 0.29.0 fixes it, and served the same model without the
+drafter within ±3% of 0.28.0 at every level, so the comparison below is engine-neutral. The 12B in fp8
+with `--speculative-config '{"model": "google/gemma-4-12B-it-assistant", "num_speculative_tokens": 4}'`,
+one engine, mean acceptance 3.1 of 4 drafted tokens:
+
+| Per engine in flight | Reference shape, req/s | Decode tok/s per request | All prompts cached | Long answers | 4,000-token unique prompts |
+|---|---|---|---|---|---|
+| 1 | 1.00 vs 0.48 (**+107%**) | 176 vs 86 (207 vs 90 on the decode shape) | | +90% at 8 to EOS | |
+| 8 | 6.08 vs 3.23 (**+88%**) | 133 vs 71 | +256% | +103% | +44% |
+| 16 | 9.54 vs 5.34 (**+79%**) | 104 vs 60 | +235% | +93% | +28% |
+| 32 | 12.35 vs 8.03 (**+54%**) | 70 vs 45 | +56% | +63% | +17% |
+| 64 | 14.23 vs 10.77 (**+32%**) | 40 vs 31 | +14% | +37% | +6% |
+
+No level lost, p95 at 64 in flight 5.4 s against 6.0 s without. The 26B mixture-of-experts with its own
+drafter, same settings, acceptance 3.0 to 3.1 of 4: +58% at 8 per engine, +60% at 16, +64% at 32, **+51% at
+64** on the reference shape (21.0 against 13.9 req/s), +48% with every prompt cached, +61 to +76% on long
+answers, and +34% to +53% single-stream (235 against 175 tok/s on 1,000-token prompts, 285 against 186 on the
+decode shape), where its decode was already fast. The EAGLE-3
+rule above (verification competes with prefill at high load) did not bite on either model: a dense 12B at fp8 has a 21,000 tok/s prefill wall
+and 64 unique 1,000-token prompts every six seconds use half of it, and a four-layer drafter that reads the
+target's KV is cheap to run. Where decode is the wall, this is the setting to turn on first.
+
 An earlier version of this document said EAGLE and multi-token prediction were not configuration options
 and had to ship inside the checkpoint. That was true of older engine versions and is wrong for 0.28.
 
@@ -1429,6 +1551,11 @@ driven from an in-region client. At 512 in flight, whole fleet:
 | 32B dense, fp8 (one engine, scaled ×8 from 4.3 req/s at 64 per engine) | ~34 | ~86 | ~32,000 (saturated at 4k prompts) | ~10 |
 | 80B hybrid MoE (3B active, linear attention on 3 of 4 layers), fp8, 4 × TP=2 on eight H100s | 34.0 at 256 | 36.0 | 76,000 | 22.1 |
 | 80B hybrid MoE, fp8, one engine on this GPU (scaled ×8 from 7.5 req/s at 64 per engine) | ~60 | ~89 | ~140,000 | ~34 |
+| 26B MoE (3.8B active, hybrid attention), fp8 (one engine, scaled ×8 from 13.85 req/s at 64 per engine) | ~111 (4.4 s) | ~196 | ~211,000 | ~78 |
+| 26B MoE (3.8B active), bf16 (one engine, scaled ×8 from 8.32 req/s at 64 per engine) | ~67 (7.5 s) | ~119 | ~116,000 | ~45 |
+| 31B dense (hybrid attention), fp8 (one engine, scaled ×8 from 3.78 req/s at 64 per engine) | ~30 (14.7 s) | ~71 | ~31,000 | ~20 |
+| 31B dense, bf16, `maxModelLen: 131072` (one engine, scaled ×8 from 1.67 req/s at 64 per engine) | ~13 (36.0 s) | ~34 | ~13,000 | ~7 |
+| 12B dense (encoder-free), bf16 (one engine, scaled ×8 from 6.08 req/s at 64 per engine) | ~49 (10.5 s) | ~205 | ~53,000 | ~39 |
 
 Which kernel ran matters as much as which weights. The startup log names it. On this GPU the 120B
 MXFP4 experts ran through the Marlin backend, which dequantises to bf16 for the matmul; in vLLM 0.28.0
@@ -1436,16 +1563,23 @@ that is the only MXFP4 path it offers this GPU generation, and on the H100 the s
 Triton MXFP4 kernel. The 27B NVFP4 build ran on the native FlashInfer CUTLASS FP4 kernel here. Read the
 lines `Using '...' Mxfp4 MoE backend`, `Using ... NvFp4 MoE backend`, `Using ... attention backend` and
 `Using ... Fp8 MoE backend` before comparing two GPUs or two formats; the numbers in this document carry
-the kernels of 0.28.0 and no other release.
+the kernels of 0.28.0 and no other release. The three Gemma 4 rows (26B, 31B, 12B) ran on vLLM's Triton
+attention kernel, not FlashInfer or FlashAttention: their global layers use 512-wide heads next to
+256-wide local ones, and the log says so (`heterogeneous head dimensions ... forcing TRITON_ATTN backend`).
+A later engine release may move those rows; the ones above them will not move with it.
 
 ### What generalises
 
 1. **Architecture first.** At the same precision the dense model needed 2.8× the GPUs of the
    mixture-of-experts for the same request rate, 5× in bf16. Before comparing precisions or tuning
    anything, compare activated parameters. The decode ceiling in *Interpreting your own measurements*
-   predicts the ratio from the model card alone.
+   predicts the ratio from the model card alone. A fourth family repeated it: a 26B mixture-of-experts
+   with 3.8B active served 5.0× the requests of its dense 31B sibling in bf16 and 3.7× in fp8, and a
+   dense 12B fell below the 26B mixture-of-experts at every level (6.1 against 8.3 req/s at 64 per
+   engine): activated parameters decide, total parameters only cost VRAM.
 2. **Precision second, and it is worth more than any knob.** fp8 over bf16 was +58% to +83% on both
-   models, most on long prompts. A 4-bit format added +26% on short prompts and +57% on long ones over
+   models, most on long prompts; on the fourth family +55% to +94% for the mixture-of-experts and +80%
+   to +230% for the dense 31B, whose bf16 weights left it starved of KV cache as well as of bandwidth. A 4-bit format added +26% on short prompts and +57% on long ones over
    fp8. Weight precision is the only setting in this repository with a 2× effect; every engine knob is
    under 30%. Throughput says nothing about answers, so the precisions were scored on the standard
    benchmarks across four model families (*What quantisation costs in answers*): fp8 weights and an fp8
@@ -1481,7 +1615,9 @@ the kernels of 0.28.0 and no other release.
    shape +44% at 8 per engine, +47% at 16, +8% at 32 with a p95 of 23 s against 6 s, and **−27% at 64
    per engine**. With every prompt cached, +57% at 64 per engine and no tail; on long answers +66% at
    64. So the loss is not batch size as such but prefill load: verifying drafts needs compute, and a
-   GPU busy prefilling unique prompts at 32 or more per engine has none to spare. Speculation is worth
+   GPU busy prefilling unique prompts at 32 or more per engine has none to spare (a dense 12B with a
+   four-layer MTP drafter, whose prefill wall is far from 64 unique prompts, gained at every level, +32%
+   at 64: *Speculative decoding*). Speculation is worth
    most where decode dominates (long answers, cache hits, moderate concurrency) and a loss on a
    prefill-heavy fleet at its knee. The draft must match the target checkpoint. Measured after a
    four-minute warm-up; the tail is not a warm-up effect.

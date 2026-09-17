@@ -173,14 +173,16 @@ quantization: "fp8"
 
 # Optional. Tool calling, which every agent framework relies on. The parser turns the model's tool-call
 # text into the API's tool_calls field; it is per model family: hermes (Qwen3), qwen3_coder (Qwen3-Coder),
-# openai (gpt-oss), llama3_json (Llama 3.x), mistral (Mistral). `vllm serve --help` lists them all.
+# openai (gpt-oss), gemma4 (Gemma 4), llama3_json (Llama 3.x), mistral (Mistral). `vllm serve --help` lists them all.
 # Empty: a request that carries `tools` gets plain text back and the agent stalls on its first step.
 # docs/tuning.md, "Tool calling".
 toolCallParser: ""
 
 # Optional. For a thinking model served with thinking on: moves the chain of thought into the
 # response's reasoning_content so clients get the answer, not the deliberation. qwen3 (Qwen3),
-# openai_gptoss (gpt-oss), deepseek_r1. Not needed with thinking off (see extraArgs below).
+# openai_gptoss (gpt-oss), gemma4 (Gemma 4), deepseek_r1. Not needed with thinking off (see extraArgs below),
+# except for Gemma 4: it writes an empty thought block after a tool turn even with thinking off, and without
+# the parser that block lands in the answer text. Set it whenever toolCallParser is gemma4.
 reasoningParser: ""
 
 # Optional. Flags appended to `vllm serve`, for anything this project does not model. Split like a
