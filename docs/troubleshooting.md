@@ -619,6 +619,18 @@ served the plain configuration within ±3% of 0.28.0 at every level. Cancel the 
 
 ---
 
+## Symptom: the engine exits at start with `Quantization method specified in the model config (compressed-tensors) does not match the quantization method specified in the quantization argument (fp8)`
+
+**Cause:** `quantization: "fp8"` (the shipped default, meant for a bf16 checkpoint) on a checkpoint that is
+already quantized and declares a different method. Red Hat's fp8 builds, NVIDIA's NVFP4 builds and Google's
+int4 builds all do; vLLM 0.28.0 compares the two names and stops, with no override for this pair. Qwen's own
+`-FP8` builds declare `fp8` and start either way, which is why the shipped Qwen rows never met it. The task
+crash-loops and the deploy sits in `UPDATE_IN_PROGRESS` (*Cause B* under that symptom).
+
+**Fix:** `quantization: ""` for any pre-quantized checkpoint, and deploy again. Read from the engine source
+and the checkpoints' `config.json`, not met in a deploy: every measured run of a pre-quantized build here
+already had the key cleared.
+
 ## Symptom: the engine dies when an evaluation asks for prompt logprobs
 
 `scripts/quality.py`, or any client sending `/v1/completions` with `echo` and `logprobs`, kills a healthy

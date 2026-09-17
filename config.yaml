@@ -164,7 +164,10 @@ estimatedParamsBillions: 30
 # "fp8" quantizes at load time. Empty keeps the model's native precision.
 # Largest single effect available: bf16 measured 7,903 input tok/s per GPU against 15,941 for fp8,
 # about 2x the fleet for the same work. Prefer a publisher's official FP8 build as modelId when one
-# exists. If you clear this for bf16 weights, set kvCacheDtype: auto below.
+# exists, and clear this when the build declares its own method: Red Hat's fp8 builds (Gemma 4, others)
+# are `compressed-tensors`, and vLLM refuses to start when that differs from this flag ("Quantization
+# method specified in the model config (compressed-tensors) does not match ... (fp8)"). Qwen's own -FP8
+# builds declare fp8 and accept either. If you clear this for bf16 weights, set kvCacheDtype: auto below.
 # NVFP4 measured another +25% over fp8 on this GPU but needs a calibrated checkpoint (set modelId to the
 # publisher's NVFP4 build and clear this): vLLM's load-time "nvfp4_per_token" refuses this GPU (it wants
 # SM100, the B200). A 27B NVFP4 build scored within noise of bf16 on gsm8k; one task, so fp8 stays the default.
