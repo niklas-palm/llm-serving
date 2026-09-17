@@ -193,7 +193,11 @@ aws ecs stop-task --cluster "$CLUSTER" --task <the PROVISIONING one> --region "$
 ```
 
 The update completed two minutes after the stop, with no rollback and no engine restart. Waiting also
-works: ECS gave up on such tasks after 35 to 55 minutes when a fleet was parked mid-deploy.
+works: ECS gave up on such tasks after 35 to 55 minutes when a fleet was parked mid-deploy. Parking
+itself can do it: taking an eight-engine host from 8 to 0 left eight `PROVISIONING` tasks with no
+container instance the second the instance went, `desiredCount` 0 and `pendingCount` 8, and the update
+sat for 35 minutes until they were stopped; it completed four minutes later. The instance was already
+gone, so this costs time, not money.
 
 **Fix for A and B: cancel the update, let it roll back, then retry.**
 
