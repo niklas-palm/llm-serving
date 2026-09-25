@@ -38,7 +38,7 @@ ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 REPO_NAME = "gpu-llm-serving"
 PROJECT_NAME = "gpu-llm-serving-build"
 ROLE_NAME = "GpuLlmServingCodeBuildRole"
-TAG = "vllm-0.28.0"   # keep in step with the base image version in container/Dockerfile
+TAG = "vllm-0.29.0"   # keep in step with the base image version in container/Dockerfile
 
 # Runs inside CodeBuild. $ECR, $REPO and $IMAGE_TAG come from the project's environment, and
 # $AWS_REGION and $AWS_ACCOUNT_ID are provided by CodeBuild itself.
