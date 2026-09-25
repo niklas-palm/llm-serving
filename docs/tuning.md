@@ -1434,23 +1434,20 @@ when it was nine times the cache. Size it against the working set that comes bac
 
 ### How speculative decoding works, and when it pays
 
-The two speculative sections below make sense once the mechanism is clear.
+Decode is slow because each new token needs its own forward pass, and a pass cannot start until the previous one
+has produced its token. Each pass reads the model's active weights from memory to make one token per request, while
+the arithmetic units sit mostly idle (*The one mental model worth having*).
 
-Decode is slow for one reason: each generated token needs its own forward pass, and a pass cannot start until the
-previous one has produced its token. Each pass streams the model's active weights out of memory to produce one token
-per request, while the arithmetic units sit mostly idle (*The one mental model worth having*).
+A forward pass predicts the next token at every position of its input, not only the last. Prefill uses this to read
+a whole prompt in one pass. Normal generation uses only the last position. Speculative decoding uses the others:
 
-A forward pass does more than predict the last token. Given a sequence, it predicts the next token at every position
-at once; prefill uses exactly this to read a whole prompt in one pass. Generation ignores all but the last position,
-because only the last one is new. Speculative decoding puts the other positions to work:
-
-1. A small draft model guesses the next few tokens as one sequence, not as alternatives. It writes them one at a
-   time like any model, but it is small (Gemma 4's drafters have four layers), so the guesses cost little.
-2. The target model runs one forward pass over the text so far plus the guesses. At every position it produces the
-   token it would have generated there. Attention only looks backwards, so its prediction after a guessed token is
-   the same one it would have made had it written that token itself.
-3. Walking the positions in order, each guess that matches the target's prediction is kept. At the first mismatch
-   the target's own prediction is kept instead, and everything after it is discarded.
+1. A small draft model guesses the next few tokens as one sequence, not as alternatives. It is small (Gemma 4's
+   drafters have four layers), so the guesses cost little.
+2. The target model runs one pass over the text so far plus the guesses. At each position it predicts the token it
+   would have written there. Attention only looks backwards, so each prediction is the one it would have made
+   without the draft.
+3. Going through the positions in order, each guess that matches the prediction is kept. At the first mismatch the
+   target's own token is kept instead, and the rest is thrown away.
 
 ```
 text so far: "The cat"                       draft guesses: "sat on the mat"
@@ -1461,19 +1458,17 @@ one target pass over "The cat sat on the mat":
 result: "sat on a", three tokens from one pass of the target model
 ```
 
-The output is what the target model would have written on its own: every kept token is its own prediction on a
-prefix it would have produced. Only the speed changes. One pass yields at least one token, no worse than without a
-draft, and at most one more than the number drafted. The attention state of the kept tokens stays in the KV cache,
-so nothing is recomputed. The engine logs the average as `Mean acceptance length` (2.2 of 3 for the 30B's EAGLE-3
-draft, 3.0 to 3.1 of 4 for Gemma 4's drafters).
+The answer is the same as without a draft, because every kept token is the target's own prediction. Only the speed
+changes. One pass gives at least one token and at most one more than the number drafted. The kept tokens stay in the
+KV cache, so nothing is computed twice. The engine logs the average as `Mean acceptance length`: 2.2 of 3 for the
+30B's EAGLE-3 draft, 3.0 to 3.1 of 4 for Gemma 4's drafters.
 
-Why it is cheap: the pass over five positions reads the weights once, like a pass over one, and the extra arithmetic
-lands on units that were idle. Why it is not free: that arithmetic is real work, rejected guesses are wasted, and the
-draft takes some KV cache (2.5 to 2.8 GiB in the drafts measured here, a few percent of the pool). So the gain depends
-on spare compute. With few requests in flight there is plenty: +107% single-stream on a dense 12B. With many unique
-prompts in flight, prefill needs that compute, and a fixed draft length lost 27% at 64 per engine on gpt-oss-120b. The
-batch-size schedule in the EAGLE-3 section below turns drafting down as the batch grows and keeps the low-load gain
-without the loss.
+It is cheap because a pass over five positions reads the weights once, like a pass over one, and the extra
+arithmetic runs on units that were idle. It is not free: the arithmetic is real work, rejected guesses are wasted,
+and the draft takes 2.5 to 2.8 GiB of KV cache in the drafts measured here. So the gain depends on spare compute.
+With few requests in flight there is plenty: +107% for one request on a dense 12B. With many unique prompts in flight,
+prefill needs that compute, and a fixed draft length lost 27% at 64 per engine on gpt-oss-120b. The batch-size
+schedule in the EAGLE-3 section below drafts less as the batch grows, which keeps the gain and removes the loss.
 
 ### N-gram speculative decoding: measured **−58%**
 
