@@ -16,8 +16,10 @@ Three questions settle most of the configuration:
    decide. Short prompts and long answers: decode, so bandwidth, fp8 weights and an fp8 cache decide.
    One command tells you (*Interpreting your own measurements*).
 
-Every number here was measured with vLLM 0.28.0; the kernels it picked are named where they matter, and
-the rows themselves are in [measurements/](../measurements/README.md).
+The project pins vLLM 0.29.0. Most numbers here were measured with 0.28.0; on one engine, 0.29.0 picked the
+same kernels and matched 0.28.0 on every model path re-measured: most rows within 5%, none beyond 11%
+(*Where the numbers come from*). The
+kernels are named where they matter, and the rows themselves are in [measurements/](../measurements/README.md).
 
 Reading paths, if you have one job today:
 
@@ -1562,10 +1564,10 @@ by the acceptance rate the log prints, which was the same in both rows.
 
 **A publisher's MTP drafter on a dense model was the largest gain measured, and it needs vLLM 0.29.0.**
 Google ships a four-layer draft model for each Gemma 4 size (`google/gemma-4-<size>-it-assistant`); it
-shares the target's KV cache and costs 2.7 GiB of it. On vLLM 0.28.0, the release this project pins, it
-crash-loops at start (`Cannot copy between CPU and CUDA tensors during CUDA graph capture` in
-`gemma4_mtp.py`; troubleshooting has the entry); 0.29.0 fixes it, and served the same model without the
-drafter within ±3% of 0.28.0 at every level, so the comparison below is engine-neutral. The 12B in fp8
+shares the target's KV cache and costs 2.7 GiB of it. On vLLM 0.28.0 it crash-loops at start (`Cannot copy
+between CPU and CUDA tensors during CUDA graph capture` in `gemma4_mtp.py`; troubleshooting has the entry).
+0.29.0, the release this project pins, fixes it, and served the same model without the drafter within ±3%
+of 0.28.0 at every level, so the comparison below is engine-neutral. The 12B in fp8
 with `--speculative-config '{"model": "google/gemma-4-12B-it-assistant", "num_speculative_tokens": 4}'`,
 one engine, mean acceptance 3.1 of 4 drafted tokens:
 
@@ -1628,12 +1630,13 @@ driven from an in-region client. At 512 in flight, whole fleet:
 | 12B dense (encoder-free), bf16 (one engine, scaled ×8 from 6.08 req/s at 64 per engine) | ~49 (10.5 s) | ~205 | ~53,000 | ~39 |
 
 Which kernel ran matters as much as which weights. The startup log names it. On this GPU the 120B
-MXFP4 experts ran through the Marlin backend, which dequantises to bf16 for the matmul; in vLLM 0.28.0
-that is the only MXFP4 path it offers this GPU generation, and on the H100 the same model used the
+MXFP4 experts ran through the Marlin backend, which dequantises to bf16 for the matmul. It is the path
+vLLM picks for gpt-oss on this GPU in 0.28.0 and 0.29.0; the native `b12x` backend that 0.29.0 adds for
+this GPU refuses the model (`kernel does not support expert biases`). On the H100 the same model used the
 Triton MXFP4 kernel. The 27B NVFP4 build ran on the native FlashInfer CUTLASS FP4 kernel here. Read the
 lines `Using '...' Mxfp4 MoE backend`, `Using ... NvFp4 MoE backend`, `Using ... attention backend` and
 `Using ... Fp8 MoE backend` before comparing two GPUs or two formats; the numbers in this document carry
-the kernels of 0.28.0 and no other release. The three Gemma 4 rows (26B, 31B, 12B) ran on vLLM's Triton
+the kernels named, and 0.29.0 chose the same ones on every path re-measured. The three Gemma 4 rows (26B, 31B, 12B) ran on vLLM's Triton
 attention kernel, not FlashInfer or FlashAttention: their global layers use 512-wide heads next to
 256-wide local ones, and the log says so (`heterogeneous head dimensions ... forcing TRITON_ATTN backend`).
 A later engine release may move those rows; the ones above them will not move with it.
@@ -2227,9 +2230,23 @@ sidecar can remote-write to Amazon Managed Service for Prometheus by swapping th
 
 ### What happens when a container is overloaded
 
-**vLLM 0.28.0 does not shed load, and it has no request timeout.** Checked in the engine source: no
-queue-depth limit, no queued-token limit, no request priority header. Re-check on an upgrade; a
-later engine that rejects with 503 above a queue depth changes this section.
+**By default the engine does not shed load, and it has no request timeout.** vLLM 0.29.0 adds one
+option, off by default: `--max-num-queued-reqs N` in `extraArgs` caps the requests one engine holds,
+running and waiting together, and answers 503 above it. (`--max-num-queued-tokens` does the same on
+prompt tokens waiting for prefill; not measured.) Measured on one engine with the 30B fp8, unique
+1,000-token prompts, 190-token answers, 60 s per level:
+
+| In flight | No limit: req/s, p50 | `--max-num-queued-reqs 128`: req/s, p50, p95 | Rejected with 503 |
+|---|---|---|---|
+| 128 | 18.5, 6.6 s | 19.0, 6.5 s, 7.4 s | 0 |
+| 256 | 24.3, 9.6 s | 18.8, 6.5 s, 7.4 s | 14,850 |
+| 512 | 24.3, 19.1 s | 18.8, 6.5 s, 11.5 s | 29,266 |
+
+The limit holds latency for the requests it admits and turns the rest away at once, so a client can retry
+on another engine or report busy. It costs throughput: the engine never runs more than the limit, so set it
+at the highest load that meets your latency budget, not below it. The 11.5 s p95 at 512 is likely the
+load generator, which was also handling about 500 rejections a second; not checked. The rest of this
+section describes the default, with no limit set.
 
 An arriving request is tokenised and put on a **waiting queue**. Each scheduler step admits waiting
 requests as three limits allow: `maxNumSeqs`, `maxNumBatchedTokens`, and free KV cache blocks. No
@@ -2251,17 +2268,16 @@ The engine never returns "busy". A queued request ends only by:
 - **finishing**, eventually.
 
 An overloaded fleet degrades silently until something external gives up. Size the *minimum* for steady
-state; autoscaling takes ~11 minutes. Real load shedding has to go in front of the engine: a
-concurrency limit at the client, or `maxNumSeqs` plus a short client timeout so over-limit work fails
-fast.
+state; autoscaling takes ~11 minutes. To fail fast instead, set `--max-num-queued-reqs` as above, or put a
+concurrency limit at the client.
 
 ---
 
 ## Where the numbers come from
 
-Every figure in this document was measured on vLLM 0.28.0 in its shipped container, through the
-CloudFront endpoint, with `scripts/benchmark.py` on an in-region EC2 client. Conditions that change
-between sections are stated where they matter; the campaigns behind them:
+Every figure in this document was measured in the project's container, through the CloudFront endpoint,
+with `scripts/benchmark.py` on an in-region EC2 client, on vLLM 0.28.0 unless the row says 0.29.0.
+Conditions that change between sections are stated where they matter; the campaigns behind them:
 
 | Measurements | Hardware | Models | Shape of the run |
 |---|---|---|---|
@@ -2274,6 +2290,7 @@ between sections are stated where they matter; the campaigns behind them:
 | Agentic quality of every precision (*What quantisation costs an agent*, *Tool calling*) | 4 × `g7e.2xlarge` in two regions, 2 × `g7e.8xlarge` in a third | Qwen3-Coder-30B-A3B, Qwen3-32B, Qwen3-30B-A3B-2507 in bf16, fp8, AWQ, NVFP4; gpt-oss-120b | BFCL v4 single and multi-turn (4,441), τ-bench retail and airline (164 tasks, 2 trials), SWE-bench Verified first 100 with mini-swe-agent, CoNLL-2003 extraction 1,000 sentences in three JSON modes; one bf16 configuration repeated for the noise floor; 1.5 to 4 h per configuration |
 | Gemma 4 (*Choosing a model to host*, *Reasoning models*, *Speculative decoding*, *`kvCacheDtype: fp8`*, *Tensor parallelism*): fit, kernels, bf16, fp8, NVFP4, the publisher's int4, thinking, the MTP drafter on 0.29.0, quality; on H100s the KV precision by kernel, TP=1, 2 and 4 over NVLink, and the Qwen reference repeated | one `g7e.2xlarge` in three regions, one `p5.48xlarge` | Gemma 4 26B-A4B MoE, 31B dense, 12B encoder-free; Qwen3-30B-A3B-2507 fp8 | same matrix, 1 to 64 per engine and 64 to 512 per host; lm-eval log-likelihood tasks chat-wrapped, GSM8K 500, IFEval 541 |
 | KV cache offload to host memory (*Offloading the cache to host memory moves the capacity wall*) | one `g7e.4xlarge` (128 GiB host RAM) in eu-west-2 | 30B MoE fp8 | six-turn conversations of 8,000 tokens, streamed, 120 to 240 s per level, 32 to 224 conversations in flight; host tier 0 or 32 GiB; one run with the GPU cache pinned to 81,376 tokens |
+| The move to vLLM 0.29.0 (*What happens when a container is overloaded*) | one `g7e.2xlarge` in ap-south-1 | 30B MoE fp8, plain and with EAGLE-3, both engines on the same host; on 0.29.0 against earlier 0.28.0 rows: dense 32B fp8, 120B MXFP4 (also both engines), Gemma 4 26B NVFP4 and 12B W4A16; the 30B quality suite | the single-engine matrix, 8 to 64 in flight; overload at 64 to 512 with and without `--max-num-queued-reqs`; same kernels chosen on both engines, most rows within 5%, none beyond 11%, quality scores within one standard error |
 
 Run-to-run noise, measured by repeating configurations: an eight-engine H100 host reproduced every row
 within ±2% back to back and across two days and two regions, and the same configuration on another
@@ -2281,7 +2298,10 @@ spot instance ten days later within +0 to +3% on every shape and level; a single
 (cached shapes ±4%), and two regions' single-engine baselines matched within 4%. The p95 of time to
 first token moves ±25% between identical runs. A difference inside those bands is not a result.
 A later engine release moves the kernel choices named in *The evidence* and *troubleshooting.md*, and
-with them every 4-bit figure and the KV precision result.
+with them every 4-bit figure and the KV precision result. Not re-measured on 0.29.0: multi-GPU topologies,
+the H100 rows, prompts above 4,000 tokens, the host-memory KV tier, Mistral, Nemotron, the 80B hybrid and
+the agentic benchmarks. Every path that was re-measured kept its kernels, so these are expected to hold, but
+they are 0.28.0 numbers.
 
 ## What this project does not do, and when to revisit
 
@@ -2296,7 +2316,7 @@ Considered and left out, each with the condition that would bring it back:
 | Pipeline parallelism, multi-node engines | Every model measured fits one instance | a model over 640 GB in fp8 |
 | Another engine (TensorRT-LLM, SGLang) | One engine, measured deeply, beats two measured shallowly for a sample | a kernel gap on a GPU generation this engine does not serve well |
 | Speculative decoding on by default | the draft is specific to the model, so it cannot ship with a `modelId` the user chooses; with a batch-size schedule it measured +17 to +54% below 32 per engine and neutral above, and a shipped MTP head +9 to +18% on one GPU (*Speculative decoding with EAGLE-3*) | a publisher draft or an MTP head exists for your model: add the one line |
-| Load shedding in the engine | vLLM 0.28.0 has no queue limit or admission control; it lives at the client | an engine release that rejects above a queue depth |
+| Load shedding on by default | vLLM 0.29.0 has it (`--max-num-queued-reqs`, one line in `extraArgs`), but the right limit depends on the latency budget, and it costs throughput (*What happens when a container is overloaded*) | every deployment needs to fail fast rather than queue |
 | Suffix decoding (a better n-gram) | needs a package the engine image does not ship; n-gram itself measured −58% | agentic or code-editing traffic with heavy repetition, and an image rebuild |
 | A prefix-aware or agent-aware gateway (per-conversation routing, request queueing, a longer origin timeout for agent steps) | The stack is one load balancer and a CDN; agent steps over 120 s hit the CDN's non-streamed limit (*Tool calling*) and the fix is to stream | your agents cannot stream and their steps run past two minutes |
 
