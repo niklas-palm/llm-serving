@@ -135,6 +135,58 @@ def test_on_demand_does_not_use_a_mixed_instances_policy():
     assert "LaunchTemplate" in asg
 
 
+BLOCK = {"id": "cr-0123456789abcdef0", "availabilityZone": "us-west-2c", "instanceType": "p5.48xlarge",
+         "instanceCount": 1, "state": "scheduled", "start": "2026-09-30 11:30:00+00:00",
+         "end": "2026-10-01 11:30:00+00:00"}
+ON_BLOCK = dict(instanceType="p5.48xlarge", availabilityZones=["us-west-2c", "us-west-2a"], capacityBlock=BLOCK,
+                estimatedParamsBillions=235, tuning={"tensorParallel": 8})
+
+
+def _asg_zones(template: dict) -> set:
+    asg = only(template, "AWS::AutoScaling::AutoScalingGroup")
+    ids = {ref["Ref"] for ref in asg["VPCZoneIdentifier"]}
+    return {template["Resources"][i]["Properties"]["AvailabilityZone"] for i in ids}
+
+
+def test_a_capacity_block_is_named_by_the_launch_template_and_the_fleet_stays_in_its_zone():
+    """Without the market type and the reservation id the instance launches as plain on-demand, which
+    for a p5 means no capacity. Without the zone, the group tries zones where the block does not exist."""
+    template = synth(**ON_BLOCK)
+    data = only(template, "AWS::EC2::LaunchTemplate")["LaunchTemplateData"]
+    assert data["InstanceMarketOptions"] == {"MarketType": "capacity-block"}
+    assert data["CapacityReservationSpecification"] == \
+        {"CapacityReservationTarget": {"CapacityReservationId": "cr-0123456789abcdef0"}}
+    assert _asg_zones(template) == {"us-west-2c"}
+    assert "MixedInstancesPolicy" not in only(template, "AWS::AutoScaling::AutoScalingGroup")
+
+
+def test_without_a_capacity_block_the_fleet_spans_every_zone_and_buys_normally():
+    template = synth(availabilityZones=["us-west-2c", "us-west-2a"])
+    data = only(template, "AWS::EC2::LaunchTemplate")["LaunchTemplateData"]
+    assert "InstanceMarketOptions" not in data and "CapacityReservationSpecification" not in data
+    assert _asg_zones(template) == {"us-west-2c", "us-west-2a"}
+
+
+@pytest.mark.parametrize("change, message", [
+    (dict(useSpot=True), "useSpot: false"),
+    (dict(instanceType="g7e.2xlarge", estimatedParamsBillions=30, tuning={}), "instanceType: p5.48xlarge"),
+    (dict(availabilityZones=["us-west-2a", "us-west-2b"]), "us-west-2c"),
+    (dict(instanceCount=2, maxInstanceCount=2), "holds 1 instance"),
+])
+def test_a_capacity_block_rejects_what_it_cannot_launch(change, message):
+    with pytest.raises(ConfigError, match=message):
+        synth(**{**ON_BLOCK, **change})
+
+
+def test_the_weights_cache_is_mounted_on_local_nvme_before_the_engine_uses_it():
+    """The 500 GiB root volume cannot hold a 600 GB checkpoint next to the image. The mount point must be
+    the host directory the task definition mounts, or the weights land on the root volume anyway."""
+    user_data = json.dumps(only(synth(), "AWS::EC2::LaunchTemplate")["LaunchTemplateData"]["UserData"])
+    assert "Instance Storage" in user_data
+    assert "mount -o noatime $dev /opt/modelcache" in user_data
+    assert "mdadm --create /dev/md0 --level=0" in user_data
+
+
 @pytest.mark.parametrize("region", ["us-west-2", "us-east-2"])
 def test_gpu_ami_is_the_al2023_gpu_image_resolved_at_deploy_time(region):
     """The hardest failure in this project, and the one with no error message anywhere.

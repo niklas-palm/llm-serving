@@ -158,6 +158,37 @@ an account may be able to get one and not the other.
 Deploy step 3 shows how to read the same answer from a running deploy within minutes rather than after
 CloudFormation's hour-long wait.
 
+### Capacity Blocks
+
+For the large GPU sizes, a Capacity Block for ML is often the only way in: you buy one or more instances
+for a fixed window (a day, a week), paid up front, in one zone. Find and buy one:
+
+```bash
+aws ec2 describe-capacity-block-offerings --region <region> --instance-type p5.48xlarge \
+  --instance-count 1 --capacity-duration-hours 24 \
+  --query 'CapacityBlockOfferings[].[CapacityBlockOfferingId,AvailabilityZone,StartDate,UpfrontFee]' --output text
+aws ec2 purchase-capacity-block --region <region> --capacity-block-offering-id <id> --instance-platform Linux/UNIX
+```
+
+Then set its id, the type, and its zone plus one more for the load balancer:
+
+```yaml
+# config.local.yaml
+capacityBlockId: cr-0123456789abcdef0
+instanceType: p5.48xlarge
+availabilityZones: ["us-west-2c", "us-west-2a"]
+useSpot: false
+```
+
+The stack reads the block at synth, launches the instances into it and only in its zone, and refuses a
+type or zone that does not match. Three rules follow from how a block works:
+
+- **Nothing launches before the start.** Deploy with both counts at 0 any time before, so the endpoint and
+  CloudFront are ready, and raise the counts once the block is active.
+- **EC2 terminates the instances 30 minutes before the end.** Park before that. The block is prepaid, so
+  a late park costs no money, only the work in flight.
+- **The block is the purchase model.** `useSpot` must be false.
+
 ### Check the instance type exists where you are deploying
 
 g7e is not in every region:

@@ -103,6 +103,12 @@ stickySessions: false
 # README.md, "Spot and instance protection".
 useSpot: false
 
+# Optional. A Capacity Block for ML: a prepaid reservation of GPU instances for a fixed window, often the
+# only way to get the large sizes. Its id (cr-...). The stack looks it up at synth, launches into it in its
+# zone, and refuses useSpot. Nothing launches before the block starts, and EC2 terminates the instances
+# 30 minutes before it ends, so park before then. README.md, "Capacity Blocks".
+capacityBlockId: ""
+
 # ---------------------------------------------------------------------------- observability
 
 # Every deployment gets a CloudWatch dashboard and two alarms (engines unhealthy, load balancer
