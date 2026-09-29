@@ -242,8 +242,8 @@ class ServingStack(Stack):
         gpu_user_data.add_commands("echo ECS_AWSVPC_BLOCK_IMDS=true >> /etc/ecs/ecs.config")
         # The weights cache goes on the instance's local NVMe drives, striped when there are several.
         # Every type in the catalog has them (1.9 TB on a g7e.2xlarge, 8 x 3.8 TB on a p5.48xlarge). The
-        # root volume cannot hold a 600 GB checkpoint next to the image, and reading one from EBS at
-        # 500 MB/s takes 20 minutes on every engine start. The drives are wiped when the instance stops,
+        # root volume cannot hold a 600 GB checkpoint next to the image, and at the volume's 500 MB/s
+        # reading one would take about 20 minutes on every engine start. The drives are wiped when the instance stops,
         # which is no loss: the cache was always per instance.
         gpu_user_data.add_commands(
             "devs=$(lsblk -dpno NAME,MODEL | awk '/Instance Storage/ {print $1}')",
