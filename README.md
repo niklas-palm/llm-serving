@@ -444,8 +444,10 @@ Without it, a gated `modelId` fails while pulling weights with a **401** in the 
 "not in the authorized list" means the token works but its account has not accepted that model's licence
 on Hugging Face; accept it there and redeploy.
 
-Weights are pulled from Hugging Face by the first task on each instance into a shared cache on the host,
-so restarts and further tasks on that instance download nothing.
+Weights are pulled from Hugging Face by the first task on each instance into a shared cache on the
+instance's local NVMe drives, so restarts and further tasks on that instance download nothing. Every
+supported type has those drives, from 1.9 TB on a `g7e.2xlarge` to 30 TB on a `p5.48xlarge`; they are
+wiped when the instance goes, like the cache itself.
 
 ### 3. Deploy
 
