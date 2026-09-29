@@ -172,3 +172,17 @@ def test_no_capacity_block_id_makes_no_aws_call(monkeypatch):
     cfg = {"region": "us-west-2", "capacityBlockId": ""}
     app.resolve_capacity_block(cfg)
     assert "capacityBlock" not in cfg
+
+
+def test_the_default_stack_name_is_unchanged_so_existing_deployments_keep_their_stack():
+    assert app.stack_name({}) == "GpuLlmServing"
+
+
+def test_a_second_stack_name_lets_two_deployments_share_a_region():
+    assert app.stack_name({"stackName": "GpuLlmServingB200"}) == "GpuLlmServingB200"
+
+
+@pytest.mark.parametrize("bad", ["1stack", "my_stack", "has space", "x" * 41])
+def test_a_stack_name_cloudformation_would_refuse_is_rejected_at_synth(bad):
+    with pytest.raises(app.ConfigError, match="stackName"):
+        app.stack_name({"stackName": bad})

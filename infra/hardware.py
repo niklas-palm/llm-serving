@@ -112,6 +112,8 @@ INSTANCES: dict[str, Instance] = {
     # NVFP4 checkpoints need Blackwell and do not run here; fp8 and bf16 do.
     "p5.4xlarge":   Instance("p5.4xlarge",   gpus=1, vcpu=16,  host_mem_gib=256,  gpu="H100", gpu_vram_gib=80, gpu_bandwidth_gbs=3350),
     "p5.48xlarge":  Instance("p5.48xlarge",  gpus=8, vcpu=192, host_mem_gib=2048, gpu="H100", gpu_vram_gib=80, gpu_bandwidth_gbs=3350),
+    # B200 (179 GiB HBM3e, 8,000 GB/s, Blackwell SM100: NVFP4 runs natively). Usually bought as a Capacity Block.
+    "p6-b200.48xlarge": Instance("p6-b200.48xlarge", gpus=8, vcpu=192, host_mem_gib=2048, gpu="B200", gpu_vram_gib=179, gpu_bandwidth_gbs=8000),
 }
 
 

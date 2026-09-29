@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import sys
 
@@ -232,6 +233,16 @@ def resolve_capacity_block(cfg: dict) -> None:
           "  park (instanceCount 0) before that.", file=sys.stderr)
 
 
+def stack_name(cfg: dict) -> str:
+    """`stackName`, default GpuLlmServing. Every account-wide name (VPC origin, dashboard, alarms, metric
+    namespace) is built from it, so two stacks with different names can share a region."""
+    name = str(cfg.get("stackName") or "GpuLlmServing").strip()
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{0,39}", name):
+        raise ConfigError(f"stackName {name!r} must start with a letter and use only letters, digits and "
+                          "hyphens, at most 40 characters.")
+    return name
+
+
 def main() -> None:
     # Wraps the stack as well as the config load. ServingStack re-validates everything itself and
     # raises a few checks that only it can make (the availability-zone list, the api key), so a
@@ -242,7 +253,7 @@ def main() -> None:
         resolve_capacity_block(cfg)
         app = cdk.App()
         ServingStack(
-            app, "GpuLlmServing",
+            app, stack_name(cfg),
             cfg=cfg,
             env=cdk.Environment(
                 account=os.environ.get("CDK_DEFAULT_ACCOUNT"),

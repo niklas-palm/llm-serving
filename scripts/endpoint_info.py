@@ -15,18 +15,18 @@ import sys
 
 import boto3
 
-from build_image import _run, config_region   # same directory
+from build_image import _run, config_region, config_stack   # same directory
 
-DEFAULT_STACK = "GpuLlmServing"
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--region", default=None, help="defaults to `region` in config.yaml")
-    ap.add_argument("--stack", default=DEFAULT_STACK, help="the CloudFormation stack name")
+    ap.add_argument("--stack", default=None, help="defaults to `stackName` in config.yaml")
     a = ap.parse_args()
 
     region = a.region or config_region()
+    a.stack = a.stack or config_stack()
     if not region:
         sys.exit("no region: set `region` in config.yaml, or pass --region")
 
