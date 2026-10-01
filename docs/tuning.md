@@ -1203,8 +1203,10 @@ model by default; `--limit-mm-per-prompt '{"image": 0}'` in `extraArgs` turns th
 | Four 512 × 512 images, unique | 1,250 | 147 | 4.7 / 7.6 / 8.7 | 12.2 |
 | The same 1024 image every time | 1,244 | 89 | 21.8 at 128 | |
 
-1. **An image costs about one token per 32 × 32 pixels**: ~1,045 tokens at 1024 px, ~277 at 512 px.
-   Downscale before sending if the task allows it.
+1. **What an image costs in tokens depends on the model.** Qwen3.8 uses about one token per 32 × 32
+   pixels: ~1,045 tokens at 1024 px, ~277 at 512 px. Gemma 4 12B (one g7e, vLLM 0.29.0) gave about 279
+   tokens for the same 1024 px image. Check yours with one request and the `usage` it returns, and
+   downscale before sending if the task allows it.
 2. **Several small images cost more than one large one of the same token count.** Four 512 px images
    processed 18% fewer input tokens per second than one 1024 px image: each image has its own
    preprocessing and encoder pass.
@@ -1682,8 +1684,22 @@ times in five on both hosts, and the results differed by topology:
 Qwen3.8-Flash-Next on H100s, vLLM 0.30.0, every prompt cached, 64 in flight, the engine counters read
 before and after: 85.9% of prompt tokens hit the cache without MTP, **0.0% with MTP** (three draft
 tokens), and nothing in the log says so. Every cached shape lost 16 to 49% with MTP on. DeepSeek's DSpark
-drafter showed hits as usual. Read `vllm:prefix_cache_hits_total` before trusting a cached benchmark with a
-drafter on (vllm#53912 tracks prefix caching with MTP on these models).
+drafter showed hits as usual.
+
+The mechanism, measured on Qwen3-Next-80B on one g7e on 0.29.0 and 0.30.0. A hit counts only whole cache
+blocks, and with a drafter on, vLLM recomputes the last cached block so the drafter has its inputs: every
+hit gives one block back. On a hybrid model the engine sizes the block to match the linear-attention
+state (`Setting attention block size to 1072 tokens` in the log, 1,104 with MTP), so a block is about a
+thousand tokens:
+
+| Cached prompt | Without MTP | With MTP |
+|---|---|---|
+| 909 tokens | 0% (shorter than one block) | 0% |
+| 3,616 tokens | 88.8% (3 blocks) | 61.0% (2 blocks) |
+
+Qwen3.8's ~940-token prompts held one block, and MTP gave it back. So on hybrid models short cached
+prompts get nothing from the prefix cache, and a drafter costs one block per request; long prompts keep
+most of it. Read `vllm:prefix_cache_hits_total` before trusting a cached benchmark with a drafter on.
 
 So: turn on a shipped MTP head on a single-GPU engine, try two draft tokens, and measure it before
 trusting it on a tensor-parallel one. The "speculation loses at load" rule of the EAGLE-3 draft did
