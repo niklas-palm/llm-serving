@@ -6,13 +6,17 @@ number can be compared with another only when those columns match.
 
 | File | One row is | Rows |
 |---|---|---|
-| `benchmarks.csv` | one concurrency level of one benchmark run: hardware, engines, model, weights, KV precision, topology, flags, kernels, prompt shape, cache state, and the results (req/s, tokens/s, p50/p95/p99, time to first token where streamed, decode speed per request) | 1,900+ |
+| `benchmarks.csv` | one concurrency level of one benchmark run: hardware, engines, model, weights, KV precision, topology, flags, kernels, prompt shape, cache state, and the results (req/s, tokens/s, p50/p95/p99, time to first token where streamed, decode speed per request) | 3,100+ |
 | `quality.csv` | one metric of one evaluation of one served configuration: family, model, weights, KV precision, thinking setting, task, setting, score, standard error | 320+ |
 | `agentic.csv` | one metric of one agentic benchmark on one served configuration: family, model, weights, KV precision, engines, benchmark, metric, value, n, harness | 270+ |
 
-All rows are vLLM 0.28.0 in this project's container except the Gemma 4 rows dated 2026-09-16 whose
-`engine_version` reads 0.29.0 (the multi-token-prediction drafter and an engine comparison; 0.29.0 measured
-within ±5% of 0.28.0 on the same models), measured through the CloudFront endpoint
+All rows are vLLM 0.28.0 in this project's container except where `engine_version` says otherwise: the
+0.29.0 rows dated 2026-09-16 (Gemma 4) and 2026-09-25 (the 0.29.0 halves of an A/B against 0.28.0 on one host;
+0.29.0 measured within ±5% of 0.28.0 on the same models), and every row dated 2026-09-29 to 2026-10-01, which
+reads 0.30.0. Those last are large models on one 8 x B200 host (`p6-b200.48xlarge`) and one 8 x H100 host
+(`p5.48xlarge`), both through Capacity Blocks in us-west-2. They include image-input rows on Qwen3.8-Flash-Next,
+sent the way `scripts/benchmark.py --images` sends them: their `prompt_tokens` is the text only and `flags`
+names the images. All are measured through the CloudFront endpoint
 from an in-region client with `scripts/benchmark.py` (60 to 120 s per level after warm-up) and
 `scripts/quality.py` (lm-evaluation-harness 0.4.13; the quality rows dated 2026-09-10 are the standard
 suite, evaluation deployments at 0.80 utilisation with a 2,048-token prefill chunk, thinking off; the Gemma 4 rows
