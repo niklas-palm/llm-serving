@@ -104,6 +104,7 @@ on-demand have separate quotas.**
 | `g7e.24xlarge` | 4 | 384 GiB | 96 | 1 TiB | **no**, needs 96 |
 | `g7e.48xlarge` | 8 | 768 GiB | 192 | 2 TiB | **no**, needs 192 |
 | `p5.4xlarge` / `p5.48xlarge` | 1 / 8 x H100 80 GiB | 80 GiB / 640 GiB | 16 / 192 | 256 GiB / 2 TiB | separate P quotas; for comparison runs, not the measured platform |
+| `p6-b200.48xlarge` | 8 x B200 179 GiB | 1,432 GiB | 192 | 2 TiB | separate P quotas; usually a Capacity Block |
 
 The shipped default of 16 needs 128 vCPU; eight fit the 64 vCPU default quota exactly. Anything larger needs an
 increase a new account will not have.
@@ -321,6 +322,20 @@ The API key lands here too, generated on first deploy (see [Notes](#notes-and-li
 `SERVING_IMAGE` and `API_KEY` are the two environment variables that override both files, for a build-and-deploy
 pipeline; an **empty** variable counts as unset. `region` is **not** settable this way: `$AWS_REGION` is
 often set to something unrelated.
+
+### Two deployments in one region
+
+`stackName` (default `GpuLlmServing`) names the stack, and every account-wide name (the VPC origin, the
+dashboard, the alarms, the metric namespace) is built from it. A second deployment in the same region
+needs only its own `config.local.yaml` with a different name, for example in a second clone:
+
+```yaml
+# config.local.yaml
+stackName: GpuLlmServingB200
+```
+
+`scripts/build_image.py` and `scripts/endpoint_info.py` read it from the same files. Changing it on a
+running deployment does not rename the stack; it creates a second one beside it.
 
 ### Access
 
@@ -810,7 +825,10 @@ BFCL, τ-bench, SWE-bench Verified and structured extraction, with the tool pars
 repeated baseline for the noise floor; a fourth family (Gemma 4: a 26B mixture-of-experts, a dense 31B and
 an encoder-free 12B) in bf16, fp8, NVFP4 and the publisher's quantisation-aware int4, with its thinking
 mode, its multi-token-prediction drafter, the same engine on two releases, and on eight H100s its KV
-precision by attention kernel and TP=1, 2 and 4 over NVLink. **Not measured:** autoscaling timings on fleets other than 6 → 8;
+precision by attention kernel and TP=1, 2 and 4 over NVLink. On vLLM 0.30.0, through Capacity Blocks on eight B200s and eight H100s: nine models
+from 230B to 1.6T parameters at TP=2 to TP=8 with and without expert and data parallelism, MLA's
+KV cache under tensor and data parallelism, speculation by GPU, NVFP4 format against layout on B200, and
+image inputs. **Not measured:** autoscaling timings on fleets other than 6 → 8;
 eight engines on one g7e host and a single-GPU H100 instance (no capacity found for either); code quality of a base model over an API (the
 agentic runs score instruct models through an agent, which is the shape that works).
 
@@ -886,6 +904,7 @@ would otherwise take a 20-minute deployment to surface.
   releases; upgrade on purpose and re-run `scripts/test_endpoint.py`.
 - **Gated models need `hfTokenSecretName`.** Without it the task fails with a 401 while pulling; with a
   token whose account has not accepted the licence, a 403.
-- **g7e, plus p5 for comparison runs.** The instance catalog in `infra/hardware.py` knows the six g7e sizes and
-  two p5 sizes and rejects anything else at synth. Another GPU family means adding its entries there; nothing
-  else assumes g7e. Every number in the docs is g7e unless it says H100.
+- **g7e, plus p5 and p6-b200 for large models and comparison runs.** The instance catalog in
+  `infra/hardware.py` knows the six g7e sizes, two p5 sizes and `p6-b200.48xlarge`, and rejects anything
+  else at synth. Another GPU family means adding its entries there; nothing else assumes g7e. Every number
+  in the docs is g7e unless it says H100 or B200.

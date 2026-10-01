@@ -24,6 +24,12 @@
 #     --location-type availability-zone --filters Name=instance-type,Values=g7e.2xlarge
 region: us-west-2
 
+# Optional. The CloudFormation stack name, default GpuLlmServing. Every account-wide name (VPC origin,
+# dashboard, alarms, metric namespace) is built from it, so a second stack in the same region needs only a
+# different name. Changing it on a running deployment creates a new stack beside the old one.
+# README.md, "Two deployments in one region".
+stackName: ""
+
 # Optional. Confine the VPC, and so the GPU instances, to these zones.
 # Empty spans up to four zones. Set it when a zone lacks the type (us-east-2: three zones, g7e in two)
 # to avoid failed launch attempts there. At least two; the load balancer needs two subnets. Spot
@@ -34,9 +40,9 @@ availabilityZones: []
 # ---------------------------------------------------------------------------- fleet
 
 # g7e.2xlarge | 4xlarge | 8xlarge | 12xlarge | 24xlarge | 48xlarge. Same 96 GiB GPU in every size;
-# larger sizes add GPUs, vCPU and host RAM. Also p5.4xlarge and p5.48xlarge (H100, 80 GiB) for a
-# comparison; every number in the docs is g7e, and NVFP4 checkpoints need Blackwell. Anything else is
-# rejected at synth.
+# larger sizes add GPUs, vCPU and host RAM. Also p5.4xlarge and p5.48xlarge (H100, 80 GiB) and
+# p6-b200.48xlarge (B200, 179 GiB), usually through a Capacity Block. Most numbers in the docs are g7e;
+# the large-model ones are H100 and B200, and say so. Anything else is rejected at synth.
 # For a model that fits one GPU, the smallest size is the best value.
 # docs/tuning.md, "For a model that fits one GPU, buy the smallest instance".
 instanceType: g7e.2xlarge
@@ -225,7 +231,8 @@ tuning:
   # Lowering it frees nothing (KV cache is allocated in blocks on demand). Use it only to reject
   # over-long requests. One exception: on a card the weights nearly fill, the engine will not start
   # unless the KV left holds one request of this length; lower it then (a 57 GB bf16 model on an 80 GB
-  # card needed 32768). docs/tuning.md, "maxModelLen".
+  # card needed 32768). With dataParallel the check is per rank, against one rank's share of the KV.
+  # docs/tuning.md, "maxModelLen".
   maxModelLen: 0
 
   # Ceiling on concurrent sequences per engine, not a reservation; N engines hold N x this. Keep it
@@ -234,7 +241,8 @@ tuning:
   maxNumSeqs: 256
 
   # Token budget per scheduler step. 0 = engine default. No measured effect from 8k to 64k, on one GPU
-  # or on a prefill-bound TP=4 engine.
+  # or on a prefill-bound TP=4 engine. Raising it is not free: the engine sizes its working memory for a
+  # full step first, and 32768 cost a large MoE 30% of its KV cache. docs/tuning.md, "maxNumBatchedTokens".
   maxNumBatchedTokens: 0
 
   # Fraction of each GPU vLLM may claim. 0.95 measured +27% over the 0.90 default (the KV cache is
@@ -250,6 +258,8 @@ tuning:
   # measure it on yours. docs/tuning.md, "kvCacheDtype".
   # With unquantised weights use "auto": fp8 packs more tokens in, batches grow, and it runs out of
   # VRAM under load. `cdk synth` warns when the weights fill more than half the card.
+  # Some models refuse fp8 here and fail at start (Qwen3.8-Flash-Next: "requires a BF16 main KV cache");
+  # set "auto" for those.
   kvCacheDtype: fp8
 
   # Reuse attention state across requests sharing a prompt prefix. Leave on: -1.2% when nothing
@@ -266,7 +276,8 @@ tuning:
   # Mixture-of-experts only, with enableExpertParallel on: attention groups inside ONE engine, each with
   # its own request batch, sharing the experts sharded across all of the engine's tensorParallel x
   # dataParallel GPUs. The load balancer then sees one target per engine. 1 = off. Refused without
-  # expert parallelism, where it is only replicas with more overhead.
+  # expert parallelism, where it is only replicas with more overhead. Lost to separate engines for
+  # Qwen3; the exception is MLA models (DeepSeek), where it multiplies the KV cache 2.8-4.2x.
   # docs/tuning.md, "Topology: replicas or tensor parallelism?".
   dataParallel: 1
 
