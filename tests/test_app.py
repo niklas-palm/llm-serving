@@ -125,3 +125,64 @@ def test_an_indented_apikey_line_is_not_the_top_level_key(tmp_path, monkeypatch)
     block it belonged to."""
     body, key = _persist(tmp_path, monkeypatch, "region: us-east-2\ntuning:\n  apiKey:\n  maxNumSeqs: 128\n")
     assert body == f"region: us-east-2\ntuning:\n  apiKey:\n  maxNumSeqs: 128\napiKey: {key}\n"
+
+
+class _FakeEc2:
+    def __init__(self, reservation):
+        self.reservation = reservation
+
+    def describe_capacity_reservations(self, CapacityReservationIds):
+        return {"CapacityReservations": [self.reservation]}
+
+
+def _resolve(monkeypatch, reservation, block_id="cr-0123456789abcdef0"):
+    import boto3
+    monkeypatch.setattr(boto3, "client", lambda *a, **k: _FakeEc2(reservation))
+    cfg = {"region": "us-west-2", "capacityBlockId": block_id}
+    app.resolve_capacity_block(cfg)
+    return cfg
+
+
+BLOCK = {"ReservationType": "capacity-block", "State": "scheduled", "AvailabilityZone": "us-west-2c",
+         "InstanceType": "p5.48xlarge", "TotalInstanceCount": 1,
+         "StartDate": "2026-09-30 11:30:00+00:00", "EndDate": "2026-10-01 11:30:00+00:00"}
+
+
+def test_a_capacity_block_id_resolves_to_its_zone_type_and_window(monkeypatch):
+    cfg = _resolve(monkeypatch, BLOCK)
+    assert cfg["capacityBlock"] == {"id": "cr-0123456789abcdef0", "availabilityZone": "us-west-2c",
+                                    "instanceType": "p5.48xlarge", "instanceCount": 1, "state": "scheduled",
+                                    "start": "2026-09-30 11:30:00+00:00", "end": "2026-10-01 11:30:00+00:00"}
+
+
+def test_an_on_demand_reservation_is_refused_as_a_capacity_block(monkeypatch):
+    """An open On-Demand Capacity Reservation is used automatically; marking it capacity-block would fail the launch."""
+    with pytest.raises(app.ConfigError, match="not a Capacity Block"):
+        _resolve(monkeypatch, {**BLOCK, "ReservationType": "default"})
+
+
+def test_an_expired_block_is_refused(monkeypatch):
+    with pytest.raises(app.ConfigError, match="expired"):
+        _resolve(monkeypatch, {**BLOCK, "State": "expired"})
+
+
+def test_no_capacity_block_id_makes_no_aws_call(monkeypatch):
+    import boto3
+    monkeypatch.setattr(boto3, "client", lambda *a, **k: pytest.fail("no call expected"))
+    cfg = {"region": "us-west-2", "capacityBlockId": ""}
+    app.resolve_capacity_block(cfg)
+    assert "capacityBlock" not in cfg
+
+
+def test_the_default_stack_name_is_unchanged_so_existing_deployments_keep_their_stack():
+    assert app.stack_name({}) == "GpuLlmServing"
+
+
+def test_a_second_stack_name_lets_two_deployments_share_a_region():
+    assert app.stack_name({"stackName": "GpuLlmServingB200"}) == "GpuLlmServingB200"
+
+
+@pytest.mark.parametrize("bad", ["1stack", "my_stack", "has space", "x" * 41])
+def test_a_stack_name_cloudformation_would_refuse_is_rejected_at_synth(bad):
+    with pytest.raises(app.ConfigError, match="stackName"):
+        app.stack_name({"stackName": bad})

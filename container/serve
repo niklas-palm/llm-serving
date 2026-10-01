@@ -28,6 +28,11 @@ mkdir -p "${HUGGINGFACE_HUB_CACHE}"
 # Entries are keyed by engine version and configuration; a stale entry is ignored, not reused.
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${SHARED_CACHE}/vllm}"
 export VLLM_ENABLE_STARTUP_PLAN="${VLLM_ENABLE_STARTUP_PLAN:-1}"
+# Two kernel compilers keep their own caches, by default in the container's home directory, so every start
+# compiled again. Measured on DeepSeek-V4-Flash on H100s (vLLM 0.30.0): engine init 165 s with these caches
+# empty, 62 s on the next start with them here (TileLang compiles skipped, JIT warmup 26.5 s -> 3.6 s).
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${SHARED_CACHE}/triton}"
+export TILELANG_CACHE_DIR="${TILELANG_CACHE_DIR:-${SHARED_CACHE}/tilelang}"
 
 ARGS=(
   # Also the served model name: /v1/models reports it and gateways route by it.

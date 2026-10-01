@@ -105,6 +105,22 @@ def local_config_path() -> str:
     return os.path.join(os.path.dirname(os.path.abspath(config_path())), "config.local.yaml")
 
 
+def config_value(key: str) -> str:
+    """A top-level value from config.yaml, overridden by config.local.yaml; empty when unset."""
+    import yaml
+    value = ""
+    for path in (config_path(), local_config_path()):
+        if not os.path.exists(path):
+            continue
+        with open(path) as fh:
+            value = ((yaml.safe_load(fh) or {}).get(key) or value)
+    return str(value).strip()
+
+
+def config_stack() -> str:
+    return config_value("stackName") or "GpuLlmServing"
+
+
 def config_region() -> str:
     """Region from config.yaml (and config.local.yaml), so it cannot drift from the deployment.
 
@@ -112,16 +128,9 @@ def config_region() -> str:
     would push the image into a region the stack never reads from, and it would then be pulled
     cross-region on every task start.
     """
-    import yaml
-    region = ""
-    for path in (config_path(), local_config_path()):
-        if not os.path.exists(path):
-            continue
-        with open(path) as fh:
-            region = ((yaml.safe_load(fh) or {}).get("region") or region)
     # No $AWS_REGION fallback, the same as app.py: that variable is commonly set to something
     # unrelated, and the build and the deploy must agree on the region.
-    return region
+    return config_value("region")
 
 
 def ensure_repo(ecr) -> None:
@@ -437,7 +446,7 @@ def main() -> int:
     # makes ECS pull the tag again.
     print("\nAlready deployed? The tag is unchanged, so `cdk deploy` will see no difference and the\n"
           "running tasks keep the OLD image. Force ECS to pull it again:\n"
-          f"  CLUSTER=$(aws cloudformation describe-stacks --stack-name GpuLlmServing --region {region} \\\n"
+          f"  CLUSTER=$(aws cloudformation describe-stacks --stack-name {config_stack()} --region {region} \\\n"
           "    --query 'Stacks[0].Outputs[?OutputKey==`ClusterName`].OutputValue' --output text)\n"
           f"  SERVICE=$(aws ecs list-services --cluster \"$CLUSTER\" --region {region} \\\n"
           "    --query 'serviceArns[0]' --output text | awk -F/ '{print $NF}')\n"

@@ -694,21 +694,51 @@ The new task logs `WorkerProc initialization failed due to an exception in a bac
 weight-loading traceback with nothing useful above it, and restarts every few minutes. The previous model
 worked on the same instance.
 
-**Cause: the host disk is full.** The weights cache is a host directory sized by the root volume (500 GiB
-here), and it keeps every model the instance has ever served. Two large checkpoints do not fit: a 236 GB
-FP8 build plus the 470 GB bf16 build of the same model overran the volume by a wide margin, and the
-download failed mid-file without saying so.
+**Cause: the weights cache is full.** The cache is `/opt/modelcache` on the instance's local NVMe drives
+(1.9 TB on a `g7e.2xlarge`, 30 TB on a `p5.48xlarge`), and it keeps every model the instance has ever
+served. It used to live on the 500 GiB root volume, where two large checkpoints did not fit: a 236 GB FP8
+build plus the 470 GB bf16 build of the same model overran it, and the download failed mid-file without
+saying so. On NVMe the same can happen on the smaller sizes after enough model changes.
 
 ```bash
 aws ssm start-session --target "$INSTANCE_ID" --region "$REGION"
-df -h /
+df -h /opt/modelcache
 du -sh /opt/modelcache/hf/hub/models--*
 ```
 
 **Fix: delete the cache directory of the model you no longer serve, then let the task restart.** The
 download resumes from the completed files. Delete `*.incomplete` blobs left by the failed attempts as
 well; they are not reused. If you switch models often, replace the instance instead (scale the ASG to
-zero and back), which gives you an empty volume.
+zero and back), which gives you empty drives.
+
+---
+
+## Symptom: a large model never becomes ready: `Timed out waiting for engine core processes to start`
+
+The log ends with `Waited 600s (configured by VLLM_ENGINE_READY_TIMEOUT_S)` and the task restarts. The
+engine itself was still loading or compiling: the API server gives up after 600 s, and the first start
+of a large model can take longer (DeepSeek-V4-Pro on eight B200s: weights 216 s, then 544 s of
+initialisation per rank). Raise the limit:
+
+```yaml
+extraEnv:
+  VLLM_ENGINE_READY_TIMEOUT_S: "1200"
+```
+
+Do not set it far higher. At 3600 a real startup error went unnoticed for an hour, because the API server
+kept waiting for an engine that had already died and no task exited. If a start is slow, search the log
+for `EngineCore failed to start` before waiting longer.
+
+---
+
+## Symptom: the engine refuses to start: `To serve at least one request with the model's max seq len`
+
+The message names the KV cache one request of `maxModelLen` needs, the cache that is available, and an
+`estimated maximum model length`. The weights leave too little room for one request at the model's own
+context. Set `tuning.maxModelLen` at or below the estimate (*`maxModelLen`* in
+[tuning.md](tuning.md)). Two settings change the available figure: with `dataParallel` it is one rank's
+share, and a larger `maxNumBatchedTokens` takes working memory from the cache (DeepSeek-V4-Flash at TP=4
+on H100s: 30.8 GiB per GPU at 8,192, 22.1 GiB at 32,768).
 
 ---
 
@@ -717,8 +747,11 @@ zero and back), which gives you an empty volume.
 **Cause A: the first task on a new instance is downloading the weights from Hugging Face.** Tens of
 GiB through the NAT gateway; later tasks and restarts on that instance hit the shared host cache.
 
-**Cause B: the root volume is throttling.** At the gp3 default of 125 MB/s, a 57 GiB model takes ~8
-minutes to read. This project provisions 500 MB/s. Check:
+**Cause B: the weights are on the root volume, not on local NVMe.** `df -h /opt/modelcache` should name an
+NVMe device (`/dev/nvme1n1`, or `/dev/md0` when several drives are striped). If it shows the root
+volume, the mount in the instance's user data failed; `/var/log/cloud-init-output.log` says why. On the
+root volume at the gp3 default of 125 MB/s a 57 GiB model takes ~8 minutes to read; this project
+provisions 500 MB/s. Check:
 
 ```bash
 aws ec2 describe-volumes --filters Name=attachment.instance-id,Values=<id> --region "$REGION" \
@@ -731,7 +764,14 @@ Raise it on a running volume with no downtime:
 aws ec2 modify-volume --volume-id <vol-id> --throughput 1000 --iops 6000 --region "$REGION"
 ```
 
-**Cause C: the disk is full.** This project mounts a host directory for the weights cache so restarts
+**Cause C: kernels compile on every start.** After `Loading weights took`, the engine compiles kernels
+for the model, with log lines such as `TileLang begins to compile kernel`, `JIT kernel warmup finished in`
+and `Graph capturing finished in`. Those results are cached in the shared volume next to the weights (`/opt/model/vllm`,
+`/opt/model/triton`, `/opt/model/tilelang` inside the container), so only the first start on an
+instance pays. DeepSeek-V4-Flash on H100s: engine initialisation 165 s on the first start, 62 s on the
+next. An image built before the Triton and TileLang caches moved there compiles again on every start.
+
+**Cause D: the root volume is full.** This project mounts a host directory for the weights cache so restarts
 share one copy. Without it, each container start writes its own copy into its writable layer, which a
 stopped container keeps; a crash-looping task can fill a 500 GB volume in under an hour. Replacing a
 model can also leave old weights behind. Loading never finishes, with no explicit error:
@@ -921,5 +961,5 @@ Useful once there:
 nvidia-smi                                    # driver and GPU health
 tail -100 /var/log/ecs/ecs-agent.log          # why a task did not start
 docker ps -a                                  # container state
-df -h /                                       # disk
+df -h / /opt/modelcache                       # root volume, weights cache
 ```

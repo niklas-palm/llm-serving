@@ -174,6 +174,22 @@ class ServingStack(Stack):
                 "  A load balancer requires subnets in two, even when the GPU instances only ever\n"
                 "  land in one of them."
             )
+        # A Capacity Block (app.py resolved `capacityBlockId` into these facts). Its instances can only
+        # launch in its zone, as its type, from a launch template that names it, and not through spot.
+        block = cfg.get("capacityBlock")
+        if block:
+            if use_spot:
+                raise ConfigError("capacityBlockId is set, so set useSpot: false. A Capacity Block is its own "
+                                  "purchase model; spot would bypass it.")
+            if block["instanceType"] != inst.name:
+                raise ConfigError(f"Capacity Block {block['id']} is for {block['instanceType']}, but "
+                                  f"instanceType is {inst.name}. Set instanceType: {block['instanceType']}.")
+            if block["availabilityZone"] not in configured_azs:
+                raise ConfigError(
+                    f"Capacity Block {block['id']} is in {block['availabilityZone']}. List that zone in\n"
+                    "  availabilityZones, with one more for the load balancer:\n"
+                    f"      availabilityZones: [\"{block['availabilityZone']}\", \"<another zone>\"]")
+
         vpc_kwargs = dict(
             ip_addresses=ec2.IpAddresses.cidr("10.30.0.0/16"),
             nat_gateways=1,
@@ -224,6 +240,19 @@ class ServingStack(Stack):
         # IMDS for awsvpc tasks explicitly rather than relying on the IMDSv2 hop limit to do it by
         # accident (the disableEcsImdsBlocking flag in cdk.json turns off the construct's own blocking).
         gpu_user_data.add_commands("echo ECS_AWSVPC_BLOCK_IMDS=true >> /etc/ecs/ecs.config")
+        # The weights cache goes on the instance's local NVMe drives, striped when there are several.
+        # Every type in the catalog has them (1.9 TB on a g7e.2xlarge, 8 x 3.8 TB on a p5.48xlarge). The
+        # root volume cannot hold a 600 GB checkpoint next to the image, and at the volume's 500 MB/s
+        # reading one would take about 20 minutes on every engine start. The drives are wiped when the instance stops,
+        # which is no loss: the cache was always per instance.
+        gpu_user_data.add_commands(
+            "devs=$(lsblk -dpno NAME,MODEL | awk '/Instance Storage/ {print $1}')",
+            "n=$(echo $devs | wc -w)",
+            'if [ "$n" -gt 1 ]; then command -v mdadm || dnf install -y -q mdadm;'
+            ' mdadm --create /dev/md0 --level=0 --raid-devices=$n $devs --run; dev=/dev/md0; else dev=$devs; fi',
+            f'if [ "$n" -gt 0 ]; then mkfs.xfs -f -q $dev && mkdir -p {HOST_MODEL_CACHE}'
+            f' && mount -o noatime $dev {HOST_MODEL_CACHE}; fi',
+        )
 
         launch_template = ec2.LaunchTemplate(
             self, "GpuLaunchTemplate",
@@ -253,6 +282,12 @@ class ServingStack(Stack):
                     delete_on_termination=True),
             )],
         )
+
+        if block:
+            cfn_lt = launch_template.node.default_child
+            cfn_lt.add_property_override("LaunchTemplateData.InstanceMarketOptions", {"MarketType": "capacity-block"})
+            cfn_lt.add_property_override("LaunchTemplateData.CapacityReservationSpecification",
+                                         {"CapacityReservationTarget": {"CapacityReservationId": block["id"]}})
 
         # Fleet size, resolved once. `maxInstanceCount` doubles as the autoscaling on/off switch:
         # anything above `instanceCount` creates a scaling policy, equal or unset pins the fleet.
@@ -291,11 +326,15 @@ class ServingStack(Stack):
                 "  Set them equal for a fixed-size fleet, or raise it to allow scale-out."
             )
         autoscaling_enabled = configured_max > instance_count
+        if block and block["instanceCount"] and configured_max > block["instanceCount"]:
+            raise ConfigError(f"Capacity Block {block['id']} holds {block['instanceCount']} instance(s); "
+                              f"maxInstanceCount is {configured_max}.")
 
         asg = autoscaling.AutoScalingGroup(
             self, "GpuAsg",
             vpc=vpc,
-            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS,
+                                            availability_zones=[block["availabilityZone"]] if block else None),
             launch_template=launch_template,
             # MinSize IS the floor, and that solves two problems at once.
             #
@@ -1138,7 +1177,8 @@ service:
         CfnOutput(self, "ResolvedTensorParallel", value=str(tuning["tensorParallel"]))
         CfnOutput(self, "ContainerMemoryMib", value=str(inst.container_memory_mib
                                                        // tuning["replicas"]))
-        CfnOutput(self, "PurchaseModel", value="spot" if use_spot else "on-demand")
+        CfnOutput(self, "PurchaseModel", value=f"capacity block {block['id']}, {block['start']} to {block['end']}"
+                  if block else "spot" if use_spot else "on-demand")
 
     def _container_image(self, image_uri: str) -> ecs.ContainerImage:
         """Resolve the image so ECS is actually allowed to pull it.

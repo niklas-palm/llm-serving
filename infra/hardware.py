@@ -44,10 +44,11 @@ WORKING_RESERVE_BYTES = 16 * 1024**3
 # and only blocks placement.
 CONTAINER_MEMORY_FRACTION = 0.60
 
-# Root volume. A 30B model is ~57 GiB and the serving image ~9 GB, and the shared host cache keeps every
-# model the instance has served, so two checkpoints must fit after a `modelId` change.
+# Root volume. It holds the ~9 GB serving image and the containers' writable layers; the weights cache is on
+# the instance's local NVMe (serving_stack.py). Kept at the size that held two 30B checkpoints before the
+# cache moved, because it is still where the weights land if the NVMe mount fails.
 ROOT_VOLUME_GIB = 500
-# The gp3 default of 125 MB/s makes reading a 57 GiB model take ~8 minutes on every task start.
+# The gp3 default of 125 MB/s would make reading a 57 GiB model from it take ~8 minutes.
 ROOT_VOLUME_THROUGHPUT_MBPS = 500
 ROOT_VOLUME_IOPS = 6000
 
@@ -111,6 +112,8 @@ INSTANCES: dict[str, Instance] = {
     # NVFP4 checkpoints need Blackwell and do not run here; fp8 and bf16 do.
     "p5.4xlarge":   Instance("p5.4xlarge",   gpus=1, vcpu=16,  host_mem_gib=256,  gpu="H100", gpu_vram_gib=80, gpu_bandwidth_gbs=3350),
     "p5.48xlarge":  Instance("p5.48xlarge",  gpus=8, vcpu=192, host_mem_gib=2048, gpu="H100", gpu_vram_gib=80, gpu_bandwidth_gbs=3350),
+    # B200 (179 GiB HBM3e, 8,000 GB/s, Blackwell SM100: NVFP4 runs natively). Usually bought as a Capacity Block.
+    "p6-b200.48xlarge": Instance("p6-b200.48xlarge", gpus=8, vcpu=192, host_mem_gib=2048, gpu="B200", gpu_vram_gib=179, gpu_bandwidth_gbs=8000),
 }
 
 

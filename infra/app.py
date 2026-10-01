@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import sys
 
@@ -197,6 +198,51 @@ def load_config() -> dict:
     return cfg
 
 
+def resolve_capacity_block(cfg: dict) -> None:
+    """Look up `capacityBlockId` and attach what the stack needs as cfg["capacityBlock"].
+
+    A synth-time call, like the CloudFront prefix-list lookup: the stack must know the block's zone to
+    place the instances there, and the instance type and window are what go wrong. The stack only reads
+    the resulting dict, so tests pass one in and need no credentials.
+    """
+    block_id = str(cfg.get("capacityBlockId") or "").strip()
+    if not block_id:
+        return
+    import boto3   # only needed on this path
+    try:
+        found = boto3.client("ec2", region_name=cfg["region"]).describe_capacity_reservations(
+            CapacityReservationIds=[block_id])["CapacityReservations"]
+    except Exception as e:   # not found, wrong region, no permission: all one fix
+        raise ConfigError(f"capacityBlockId {block_id} could not be read in {cfg['region']}: {e}") from None
+    r = found[0]
+    if r.get("ReservationType") != "capacity-block":
+        raise ConfigError(
+            f"{block_id} is not a Capacity Block (type {r.get('ReservationType')}).\n"
+            "  capacityBlockId is for Capacity Blocks for ML. An open On-Demand Capacity Reservation needs no\n"
+            "  setting: matching instances use it automatically.")
+    if r["State"] in ("expired", "cancelled", "failed"):
+        raise ConfigError(f"Capacity Block {block_id} is {r['State']}.")
+    cfg["capacityBlock"] = {
+        "id": block_id, "availabilityZone": r["AvailabilityZone"], "instanceType": r["InstanceType"],
+        "instanceCount": int(r.get("TotalInstanceCount") or 0), "state": r["State"],
+        "start": str(r["StartDate"]), "end": str(r["EndDate"]),
+    }
+    print(f"Capacity Block {block_id}: {r['InstanceType']} in {r['AvailabilityZone']}, {r['State']}, "
+          f"{r['StartDate']} to {r['EndDate']}.\n"
+          "  Nothing launches before the start. EC2 terminates the instances 30 minutes before the end:\n"
+          "  park (instanceCount 0) before that.", file=sys.stderr)
+
+
+def stack_name(cfg: dict) -> str:
+    """`stackName`, default GpuLlmServing. Every account-wide name (VPC origin, dashboard, alarms, metric
+    namespace) is built from it, so two stacks with different names can share a region."""
+    name = str(cfg.get("stackName") or "GpuLlmServing").strip()
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{0,39}", name):
+        raise ConfigError(f"stackName {name!r} must start with a letter and use only letters, digits and "
+                          "hyphens, at most 40 characters.")
+    return name
+
+
 def main() -> None:
     # Wraps the stack as well as the config load. ServingStack re-validates everything itself and
     # raises a few checks that only it can make (the availability-zone list, the api key), so a
@@ -204,9 +250,10 @@ def main() -> None:
     # also means app.py cannot drift from the stack.
     try:
         cfg = load_config()
+        resolve_capacity_block(cfg)
         app = cdk.App()
         ServingStack(
-            app, "GpuLlmServing",
+            app, stack_name(cfg),
             cfg=cfg,
             env=cdk.Environment(
                 account=os.environ.get("CDK_DEFAULT_ACCOUNT"),

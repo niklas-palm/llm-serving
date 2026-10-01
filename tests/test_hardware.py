@@ -527,6 +527,17 @@ def test_the_p5_entries_carry_their_own_gpu_and_size_against_it():
         get_instance("p4d.24xlarge")
 
 
+def test_the_b200_entry_sizes_the_largest_checkpoints_against_its_own_vram():
+    """A B200 holds 179 GiB, more than twice an H100. Sized against 80 GiB, a 756 GB fp8 model would be refused
+    on the one instance in the catalog it fits."""
+    b200 = get_instance("p6-b200.48xlarge")
+    assert (b200.gpu, b200.gpus, b200.gpu_vram_gib, b200.total_vram_gib) == ("B200", 8, 179, 1432)
+    assert derive_tensor_parallel(b200, model_bytes(756, 1.0)) == 8, "704 GiB over 154 GiB per GPU needs 5, so 8"
+    assert derive_tensor_parallel(b200, model_bytes(230, 1.0)) == 2, "214 GiB over 154 GiB per GPU"
+    with pytest.raises(ConfigError, match="does not fit on p6-b200.48xlarge"):
+        derive_tensor_parallel(b200, model_bytes(1600, 1.0))
+
+
 def test_natively_4bit_families_without_a_marker_in_the_id_are_still_sized_as_4bit():
     """openai/gpt-oss-120b ships only in MXFP4 and its id says nothing about precision; sized at 2 bytes
     it was 240 GB and 'did not fit' a card it fits with room to spare."""

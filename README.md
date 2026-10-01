@@ -104,6 +104,7 @@ on-demand have separate quotas.**
 | `g7e.24xlarge` | 4 | 384 GiB | 96 | 1 TiB | **no**, needs 96 |
 | `g7e.48xlarge` | 8 | 768 GiB | 192 | 2 TiB | **no**, needs 192 |
 | `p5.4xlarge` / `p5.48xlarge` | 1 / 8 x H100 80 GiB | 80 GiB / 640 GiB | 16 / 192 | 256 GiB / 2 TiB | separate P quotas; for comparison runs, not the measured platform |
+| `p6-b200.48xlarge` | 8 x B200 179 GiB | 1,432 GiB | 192 | 2 TiB | separate P quotas; usually a Capacity Block |
 
 The shipped default of 16 needs 128 vCPU; eight fit the 64 vCPU default quota exactly. Anything larger needs an
 increase a new account will not have.
@@ -157,6 +158,37 @@ an account may be able to get one and not the other.
 
 Deploy step 3 shows how to read the same answer from a running deploy within minutes rather than after
 CloudFormation's hour-long wait.
+
+### Capacity Blocks
+
+For the large GPU sizes, a Capacity Block for ML is often the only way in: you buy one or more instances
+for a fixed window (a day, a week), paid up front, in one zone. Find and buy one:
+
+```bash
+aws ec2 describe-capacity-block-offerings --region <region> --instance-type p5.48xlarge \
+  --instance-count 1 --capacity-duration-hours 24 \
+  --query 'CapacityBlockOfferings[].[CapacityBlockOfferingId,AvailabilityZone,StartDate,UpfrontFee]' --output text
+aws ec2 purchase-capacity-block --region <region> --capacity-block-offering-id <id> --instance-platform Linux/UNIX
+```
+
+Then set its id, the type, and its zone plus one more for the load balancer:
+
+```yaml
+# config.local.yaml
+capacityBlockId: cr-0123456789abcdef0
+instanceType: p5.48xlarge
+availabilityZones: ["us-west-2c", "us-west-2a"]
+useSpot: false
+```
+
+The stack reads the block at synth, launches the instances into it and only in its zone, and refuses a
+type or zone that does not match. Three rules follow from how a block works:
+
+- **Nothing launches before the start.** Deploy with both counts at 0 any time before, so the endpoint and
+  CloudFront are ready, and raise the counts once the block is active.
+- **EC2 terminates the instances 30 minutes before the end.** Park before that. The block is prepaid, so
+  a late park costs no money, only the work in flight.
+- **The block is the purchase model.** `useSpot` must be false.
 
 ### Check the instance type exists where you are deploying
 
@@ -291,6 +323,20 @@ The API key lands here too, generated on first deploy (see [Notes](#notes-and-li
 pipeline; an **empty** variable counts as unset. `region` is **not** settable this way: `$AWS_REGION` is
 often set to something unrelated.
 
+### Two deployments in one region
+
+`stackName` (default `GpuLlmServing`) names the stack, and every account-wide name (the VPC origin, the
+dashboard, the alarms, the metric namespace) is built from it. A second deployment in the same region
+needs only its own `config.local.yaml` with a different name, for example in a second clone:
+
+```yaml
+# config.local.yaml
+stackName: GpuLlmServingB200
+```
+
+`scripts/build_image.py` and `scripts/endpoint_info.py` read it from the same files. Changing it on a
+running deployment does not rename the stack; it creates a second one beside it.
+
 ### Access
 
 The endpoint is `https://<id>.cloudfront.net`, printed by `python3 scripts/endpoint_info.py` and in the
@@ -413,8 +459,10 @@ Without it, a gated `modelId` fails while pulling weights with a **401** in the 
 "not in the authorized list" means the token works but its account has not accepted that model's licence
 on Hugging Face; accept it there and redeploy.
 
-Weights are pulled from Hugging Face by the first task on each instance into a shared cache on the host,
-so restarts and further tasks on that instance download nothing.
+Weights are pulled from Hugging Face by the first task on each instance into a shared cache on the
+instance's local NVMe drives, so restarts and further tasks on that instance download nothing. Every
+supported type has those drives, from 1.9 TB on a `g7e.2xlarge` to 30 TB on a `p5.48xlarge`; they are
+wiped when the instance goes, like the cache itself.
 
 ### 3. Deploy
 
@@ -777,7 +825,10 @@ BFCL, τ-bench, SWE-bench Verified and structured extraction, with the tool pars
 repeated baseline for the noise floor; a fourth family (Gemma 4: a 26B mixture-of-experts, a dense 31B and
 an encoder-free 12B) in bf16, fp8, NVFP4 and the publisher's quantisation-aware int4, with its thinking
 mode, its multi-token-prediction drafter, the same engine on two releases, and on eight H100s its KV
-precision by attention kernel and TP=1, 2 and 4 over NVLink. **Not measured:** autoscaling timings on fleets other than 6 → 8;
+precision by attention kernel and TP=1, 2 and 4 over NVLink. On vLLM 0.30.0, through Capacity Blocks on eight B200s and eight H100s: nine models
+from about 180B to 1.6T parameters at TP=2 to TP=8 with and without expert and data parallelism, MLA's
+KV cache under tensor and data parallelism, speculation by GPU, NVFP4 format against layout on B200, and
+image inputs. **Not measured:** autoscaling timings on fleets other than 6 → 8;
 eight engines on one g7e host and a single-GPU H100 instance (no capacity found for either); code quality of a base model over an API (the
 agentic runs score instruct models through an agent, which is the shape that works).
 
@@ -853,6 +904,7 @@ would otherwise take a 20-minute deployment to surface.
   releases; upgrade on purpose and re-run `scripts/test_endpoint.py`.
 - **Gated models need `hfTokenSecretName`.** Without it the task fails with a 401 while pulling; with a
   token whose account has not accepted the licence, a 403.
-- **g7e, plus p5 for comparison runs.** The instance catalog in `infra/hardware.py` knows the six g7e sizes and
-  two p5 sizes and rejects anything else at synth. Another GPU family means adding its entries there; nothing
-  else assumes g7e. Every number in the docs is g7e unless it says H100.
+- **g7e, plus p5 and p6-b200 for large models and comparison runs.** The instance catalog in
+  `infra/hardware.py` knows the six g7e sizes, two p5 sizes and `p6-b200.48xlarge`, and rejects anything
+  else at synth. Another GPU family means adding its entries there; nothing else assumes g7e. Every number
+  in the docs is g7e unless it says H100 or B200.
