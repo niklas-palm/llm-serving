@@ -713,6 +713,35 @@ zero and back), which gives you empty drives.
 
 ---
 
+## Symptom: a large model never becomes ready: `Timed out waiting for engine core processes to start`
+
+The log ends with `Waited 600s (configured by VLLM_ENGINE_READY_TIMEOUT_S)` and the task restarts. The
+engine itself was still loading or compiling: the API server gives up after 600 s, and the first start
+of a large model can take longer (DeepSeek-V4-Pro on eight B200s: weights 216 s, then 544 s of
+initialisation per rank). Raise the limit:
+
+```yaml
+extraEnv:
+  VLLM_ENGINE_READY_TIMEOUT_S: "1200"
+```
+
+Do not set it far higher. At 3600 a real startup error went unnoticed for an hour, because the API server
+kept waiting for an engine that had already died and no task exited. If a start is slow, search the log
+for `EngineCore failed to start` before waiting longer.
+
+---
+
+## Symptom: the engine refuses to start: `To serve at least one request with the model's max seq len`
+
+The message names the KV cache one request of `maxModelLen` needs, the cache that is available, and an
+`estimated maximum model length`. The weights leave too little room for one request at the model's own
+context. Set `tuning.maxModelLen` at or below the estimate (*`maxModelLen`* in
+[tuning.md](tuning.md)). Two settings change the available figure: with `dataParallel` it is one rank's
+share, and a larger `maxNumBatchedTokens` takes working memory from the cache (DeepSeek-V4-Flash at TP=4
+on H100s: 30.8 GiB per GPU at 8,192, 22.1 GiB at 32,768).
+
+---
+
 ## Symptom: model loading takes far longer than expected
 
 **Cause A: the first task on a new instance is downloading the weights from Hugging Face.** Tens of
@@ -735,7 +764,14 @@ Raise it on a running volume with no downtime:
 aws ec2 modify-volume --volume-id <vol-id> --throughput 1000 --iops 6000 --region "$REGION"
 ```
 
-**Cause C: the root volume is full.** This project mounts a host directory for the weights cache so restarts
+**Cause C: kernels compile on every start.** After `Loading weights took`, the engine compiles kernels
+for the model, with log lines such as `TileLang begins to compile kernel`, `JIT kernel warmup finished in`
+and `Graph capturing finished in`. Those results are cached in the shared volume next to the weights (`/opt/model/vllm`,
+`/opt/model/triton`, `/opt/model/tilelang` inside the container), so only the first start on an
+instance pays. DeepSeek-V4-Flash on H100s: engine initialisation 165 s on the first start, 62 s on the
+next. An image built before the Triton and TileLang caches moved there compiles again on every start.
+
+**Cause D: the root volume is full.** This project mounts a host directory for the weights cache so restarts
 share one copy. Without it, each container start writes its own copy into its writable layer, which a
 stopped container keeps; a crash-looping task can fill a 500 GB volume in under an hour. Replacing a
 model can also leave old weights behind. Loading never finishes, with no explicit error:

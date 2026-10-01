@@ -711,6 +711,18 @@ convenience of fp8 has no NVFP4 equivalent.
 4.54 s against 6.33 s. Acceptance length fell from 2.2 to 1.95, since the speculator was trained against
 the bf16 model, and it still added 17% on top of NVFP4 alone.
 
+**On B200s NVFP4 pays twice: native FP4 kernels, and the smaller layout it fits.** Measure the two
+apart. GLM-5.3-Flash on eight B200s, vLLM 0.30.0, NVIDIA's NVFP4 build against the publisher's fp8:
+
+| Change | Reference shape at 128 to 512 | 4k unique prompts | One request |
+|---|---|---|---|
+| Format alone: fp8 → NVFP4, both 2 × TP=4 | **+12 to +39%** (−11% at 64) | −8 to +34% | +6% |
+| Layout alone: NVFP4 2 × TP=4 → 4 × TP=2 | −17 to +3% | **+24 to +58%** | −10% |
+
+For the larger GLM-5.3, fp8 (756 GB) needs all eight GPUs and NVFP4 (464 GB) fits four: NVFP4 at
+2 × TP=4 against fp8 at 1 × TP=8 measured 41.6 against 21.0 rps at 512 in flight, most of it the second
+engine. The quality of these NVFP4 builds was not measured.
+
 #### 4-bit is two different products on this GPU: native FP4 compute, or weight-only dequantisation
 
 Measured on Gemma 4 with the same matrix on one engine, each 4-bit build against its own family's fp8:
@@ -859,6 +871,37 @@ replica inside it is invisible to health checks; and one process is one failure 
 To try it anyway, set `dataParallel:` in `config.yaml` (it requires `enableExpertParallel: true`;
 synth refuses the combination otherwise) and measure against the same GPUs as separate engines.
 
+#### The exception: MLA models, where data parallelism multiplies the KV cache
+
+DeepSeek-style models use multi-head latent attention (MLA): one compressed latent per token, shared by
+every head. Tensor parallelism splits attention by head, so **every TP rank keeps the whole latent
+cache**, and four TP ranks hold one GPU's worth of distinct tokens. With `dataParallel` each rank holds
+its own requests and the capacity adds up. DeepSeek-V4-Flash on eight GPUs, two engines either way,
+vLLM 0.30.0, from the engine logs:
+
+| Host | 2 × TP=4 | 2 × (DP=4 + EP) | Ratio |
+|---|---|---|---|
+| 8 × B200, 0.95 | 7.9M tokens per engine | 33.0M | 4.2× |
+| 8 × H100, 0.95 vs 0.90 | 3.2M | 9.05M | 2.8× (at the lower utilisation) |
+
+Throughput on the H100s, DP=4 + EP against TP=4, 64 requests in flight unless stated:
+
+| Shape | DP=4 + EP against TP=4 |
+|---|---|
+| 1, 8, 32 in flight, 1k prompts | −32%, −19%, −18% |
+| Unique prompts of 1k, 4k, 16k, 32k | −7%, −3%, **+21%, +80%** |
+| Unique 4k prompts at 512 in flight | **+316%** (TP=4 fell to 2.0 rps) |
+| The same 16k and 32k prompts, cached | **−17%, −32%** |
+
+On the B200s the publisher's recipe for this layout (DP=4 + EP with its own MoE kernel) against plain
+TP=4 measured +52 to +54% on 4k unique prompts at 256 to 512 in flight, and 0.85× for one request.
+
+**So for an MLA model, try `dataParallel` with expert parallelism when prompts are long and unique or
+the cache is the limit; keep tensor parallelism for cached, low-concurrency or decode-bound traffic.**
+The capacity gain is the mechanism above. Why long unique prompts gain even where capacity does not bind
+is not established: it is not the duplicated cache reads under TP, because with the same prompts cached
+DP lost. The gain is in prefill.
+
 #### When the model needs several GPUs: the smallest degree that fits, then replicas
 
 The rule above was measured with a model that fits one GPU. It holds, harder, when the model does not.
@@ -884,6 +927,16 @@ GPUs instead of four. Under load the two engines won every shape.
 A second, mechanical reason the single engine lost at 512: **one engine caps concurrent sequences at
 `maxNumSeqs`** (256 by default), so half the requests queued behind the other half (cached p50 8.5 s
 against 5.1 s). Two engines hold 2 × 256 without changing anything.
+
+How much of the gap the cap explains, measured on a hybrid mixture-of-experts (Qwen3.8-Flash-Next) on
+the same kind of host, vLLM 0.30.0: one TP=8 engine raised to `maxNumSeqs: 512` against two TP=4 engines
+still lost 20% at 256 in flight and 29% at 512 on the reference shape (43% at 512 with the default cap),
+45 to 56% on 4k unique prompts and about 40% on long answers. **The cap is about a third of the gap on
+short prompts at 512 and none of it on long ones; the topology is the rest.**
+
+The rule held at a trillion parameters: Kimi-K2.6 (INT4) on eight B200s, two TP=4 engines against one
+TP=8, measured +16 to +33% on 1k prompts and +98 to +128% on 4k unique prompts at 256 to 512 in flight.
+At 1 to 32 in flight the TP=8 engine was 4 to 15% faster; from 64 they were level.
 
 The same host also ran the bf16 build of the model (470 GB, TP=8 is the only fit). bf16 at TP=8 measured
 8.3 / 11.5 / 15.1 / 15.4 rps on the reference shape at 64 / 128 / 256 / 512 in flight, against 7.9 / 10.0 /
@@ -930,7 +983,10 @@ For throughput, in order:
 **Measured:** one GPU at TP=1, and two GPUs three ways (TP=2, TP=1 with one GPU idle, 2 × TP=1
 replicas) at concurrency 256, cached and uncached, on this GPU. On eight H100s (`p5.48xlarge`): eight
 engines at TP=1 with models that fit one GPU, and a 235B mixture-of-experts that does not, as 2 × TP=4,
-1 × TP=8 and DP=2 × TP=4, with and without expert parallelism (*Topology*).
+1 × TP=8 and DP=2 × TP=4, with and without expert parallelism (*Topology*). On eight B200s
+(`p6-b200.48xlarge`) and eight H100s, through Capacity Blocks on vLLM 0.30.0: models from 230B to 1.6T
+(DeepSeek-V4 Flash and Pro, GLM-5.3 and GLM-5.3-Flash, Kimi-K2.6, MiniMax-M2.7, Qwen3.8-Flash-Next,
+Qwen3-Coder-480B, Step-3.7-Flash) at TP=2 to TP=8, with and without expert and data parallelism.
 
 **Not measured: TP=4 and TP=8 on this GPU.** Four- and eight-GPU instances of this generation were not
 obtainable during testing. The H100 results are the best guide: the collective cost grew with the
@@ -1132,6 +1188,38 @@ answer would break the caller; do not expect it to extract better.
 
 ---
 
+## Image inputs: tokens follow pixels, and a repeated image is cached
+
+Measured on Qwen3.8-Flash-Next (2 × TP=4 with expert parallelism on eight H100s, vLLM 0.30.0), images
+placed before 200 tokens of text (`scripts/benchmark.py --images 1 --input-tokens 200`, which sends
+them through `/v1/chat/completions`). vLLM accepts images for such a
+model by default; `--limit-mm-per-prompt '{"image": 0}'` in `extraArgs` turns them off.
+
+| Request | Input tokens | Output tokens | req/s at 16 / 64 / 128 in flight | Decode tok/s per request at 128 |
+|---|---|---|---|---|
+| 1,000 tokens of text | 940 | 187 | 5.1 / 9.9 / 12.8 | 23.2 |
+| One 1024 × 1024 image, unique | 1,244 | 107 | 5.6 / 9.4 / 10.7 | 10.3 |
+| One 512 × 512 image, unique | 477 | 107 | 9.1 / 12.7 / 15.7 | 14.2 |
+| Four 512 × 512 images, unique | 1,250 | 147 | 4.7 / 7.6 / 8.7 | 12.2 |
+| The same 1024 image every time | 1,244 | 89 | 21.8 at 128 | |
+
+1. **An image costs about one token per 32 × 32 pixels**: ~1,045 tokens at 1024 px, ~277 at 512 px.
+   Downscale before sending if the task allows it.
+2. **Several small images cost more than one large one of the same token count.** Four 512 px images
+   processed 18% fewer input tokens per second than one 1024 px image: each image has its own
+   preprocessing and encoder pass.
+3. **Images slow decoding for everyone more than text does.** At 128 in flight decode per request halved
+   against text of similar size: the vision encoder runs inside the same engine steps.
+4. **A repeated image is a cached prefix.** With the image first in the prompt, 62.9% of prompt tokens hit
+   the prefix cache and the engine served 2.1× the requests of unique images. Put shared images before
+   the text that varies.
+5. **`--mm-encoder-tp-mode data`** (the vision encoder copied to each GPU instead of split) measured +6 to
+   +12% with four images per request, within noise for one.
+6. **Turning image input on cost 2.4% of the KV cache**, and text throughput measured 5 to 10% lower than
+   the same engine with images off, one run each.
+
+---
+
 ## Engine tuning
 
 ### `gpuMemoryUtilization: 0.95`: the biggest single effect for a model that fills the card
@@ -1166,6 +1254,12 @@ same hardware crashed under load.
 
    The stack warns at synth time when it detects this; [troubleshooting.md](troubleshooting.md) has
    the diagnostic.
+3. **Large mixture-of-experts on 80 GB cards, and draft heads.** DeepSeek-V4-Flash at `dataParallel: 4`
+   with expert parallelism on H100s started at 0.95, passed its health check, and lost every rank on the
+   first benchmark requests (an allocation in `aten::new_empty` failed); 0.90 ran the full matrix. GLM-5.3-Flash at
+   TP=8 with its MTP head (five draft tokens) died with CUDA out of memory on the first batch of 4k
+   prompts at 128 in flight. Both need working memory that grows with the batch. On an 80 GB card with
+   either, start at 0.90.
 
    | weights | KV cache | why |
    |---|---|---|
@@ -1294,6 +1388,10 @@ weights nearly fill (a 57 GB bf16 model on an 80 GB card, 16 GiB left, 24 GiB ne
 request) the model's default context makes the engine fail at startup; `maxModelLen: 32768` starts it.
 On the 96 GB cards this document is measured on, none of the models tested came close.
 
+With `dataParallel` the check is per rank, against one rank's share of the cache. DeepSeek-V4-Pro at
+`dataParallel: 8` on B200s kept 14.56 GiB of KV per rank against 21.35 GiB for one request at its 1M
+default, and refused to start; `maxModelLen: 24576` started it.
+
 ### `maxNumSeqs: 256`
 
 Ceiling on concurrent sequences. A ceiling, not a reservation: it reserves no memory; too low leaves
@@ -1330,6 +1428,11 @@ to give it a chance (a 235B mixture-of-experts at TP=4 on H100s, where 4,000-tok
 flat 7 rps from 64 to 512 in flight): 16,384 moved every shape by under 5%, inside run-to-run noise. The
 chunked-prefill budget is not what limits prefill; the tensor cores and the all-reduce are.
 
+**Raising it costs KV cache.** At startup the engine runs one step of the full budget to measure its
+peak working memory, and the KV cache gets what is left. DeepSeek-V4-Flash at TP=4 on H100s: 30.8 GiB of
+KV per GPU at the default 8,192, 22.1 GiB at 32,768, and at that size its 1M default context no longer
+started.
+
 ### `kvCacheDtype: fp8`
 
 Stores the KV cache at 8 bits instead of 16. Measured **+12% decode** at full load (163.7 vs 146.7,
@@ -1363,6 +1466,9 @@ mixed traffic, +17 to +46% on 4,000-token unique prompts (74.9 against 51.3 req/
 log says which kernel ran (`Using ... attention backend out of potential backends: [...]`); when `fp8`
 narrows the list to Triton, `auto` is the faster setting. On the g7e the list is Triton either way for
 this family (FlashAttention 4 does not support the head size there), so its rows stand as measured.
+
+**Some models refuse it.** Qwen3.8-Flash-Next's sparse attention fails at start on vLLM 0.30.0 with
+`NotImplementedError: Qwen4Exp QSA requires a BF16 main KV cache`; set `auto` for it.
 
 **On by default here.** It is a lossy store for cached attention state; to rule that out, set
 `kvCacheDtype: auto`, and do so when it buys a better attention kernel.
@@ -1472,6 +1578,17 @@ With few requests in flight there is plenty: +107% for one request on a dense 12
 prefill needs that compute, and a fixed draft length lost 27% at 64 per engine on gpt-oss-120b. The batch-size
 schedule in the EAGLE-3 section below drafts less as the batch grows, which keeps the gain and removes the loss.
 
+**The load where it stops paying is set by the GPU.** DeepSeek-V4-Flash with its own drafter (DSpark,
+seven draft tokens), the same layout on eight B200s and on eight H100s, vLLM 0.30.0:
+
+| | One request | 512 in flight, unique 1k prompts | 512 in flight, cached |
+|---|---|---|---|
+| 8 × B200 | +115% | 0% | +48 to +124% (64 to 512 in flight) |
+| 8 × H100 | +90% | **−34%** | **−17%** |
+
+The H100 has about half the B200's tensor throughput, so the same drafter that was free at full load on
+one cost a third on the other.
+
 ### N-gram speculative decoding: measured **−58%**
 
 Drafts several tokens ahead from the prompt, then verifies them in one pass. Output is identical, so it
@@ -1539,6 +1656,10 @@ The static K=3 measured −27% at 64 on the same shape. With the schedule the lo
 high-load loss becomes noise, so one configuration holds across the day. At one request in flight the
 draft gave 199 against 168 tokens per second.
 
+**vLLM 0.30.0 ignores the schedule when `dataParallel` is above 1.** It logs `Dynamic speculative decoding
+is not supported with data parallelism` and drafts the fixed length: ranks choosing different lengths
+would deadlock. The engine counters confirmed it (7.00 draft tokens per draft on every rank).
+
 **Warm every batch regime before you trust the first minute.** The first time the engine ran a new
 draft length at a new batch size it stalled for about 30 s (p95 31 to 35 s at those levels, a clean 2 to
 8 s at every level once seen). The identical sweep run a second time in reverse order showed no stall
@@ -1556,6 +1677,13 @@ times in five on both hosts, and the results differed by topology:
 | One engine on this GPU (TP=1), one draft token | decode per request **+9 to +18%** at every level up to 64 in flight; unique-prompt request rate +3 to +24%; the head took 2.8 of 11.5 GiB of KV cache, so cached shapes that were pool-bound lost |
 | Same, two draft tokens | **+9 to +41%** on every unique shape, better than one token at every level including 64 in flight; one request in flight +30% |
 | Four engines at TP=2 on eight H100s | decode per request −6% to +5%; long prompts −15 to −31%: the verify step across two GPUs cost about what the saved token was worth |
+
+**On a hybrid linear-attention model a draft head can switch off prefix caching, silently.**
+Qwen3.8-Flash-Next on H100s, vLLM 0.30.0, every prompt cached, 64 in flight, the engine counters read
+before and after: 85.9% of prompt tokens hit the cache without MTP, **0.0% with MTP** (three draft
+tokens), and nothing in the log says so. Every cached shape lost 16 to 49% with MTP on. DeepSeek's DSpark
+drafter showed hits as usual. Read `vllm:prefix_cache_hits_total` before trusting a cached benchmark with a
+drafter on (vllm#53912 tracks prefix caching with MTP on these models).
 
 So: turn on a shipped MTP head on a single-GPU engine, try two draft tokens, and measure it before
 trusting it on a tensor-parallel one. The "speculation loses at load" rule of the EAGLE-3 draft did
@@ -2276,7 +2404,7 @@ concurrency limit at the client.
 ## Where the numbers come from
 
 Every figure in this document was measured in the project's container, through the CloudFront endpoint,
-with `scripts/benchmark.py` on an in-region EC2 client, on vLLM 0.28.0 unless the row says 0.29.0.
+with `scripts/benchmark.py` on an in-region EC2 client, on vLLM 0.28.0 unless the row says 0.29.0 or 0.30.0.
 Conditions that change between sections are stated where they matter; the campaigns behind them:
 
 | Measurements | Hardware | Models | Shape of the run |
@@ -2291,6 +2419,8 @@ Conditions that change between sections are stated where they matter; the campai
 | Gemma 4 (*Choosing a model to host*, *Reasoning models*, *Speculative decoding*, *`kvCacheDtype: fp8`*, *Tensor parallelism*): fit, kernels, bf16, fp8, NVFP4, the publisher's int4, thinking, the MTP drafter on 0.29.0, quality; on H100s the KV precision by kernel, TP=1, 2 and 4 over NVLink, and the Qwen reference repeated | one `g7e.2xlarge` in three regions, one `p5.48xlarge` | Gemma 4 26B-A4B MoE, 31B dense, 12B encoder-free; Qwen3-30B-A3B-2507 fp8 | same matrix, 1 to 64 per engine and 64 to 512 per host; lm-eval log-likelihood tasks chat-wrapped, GSM8K 500, IFEval 541 |
 | KV cache offload to host memory (*Offloading the cache to host memory moves the capacity wall*) | one `g7e.4xlarge` (128 GiB host RAM) in eu-west-2 | 30B MoE fp8 | six-turn conversations of 8,000 tokens, streamed, 120 to 240 s per level, 32 to 224 conversations in flight; host tier 0 or 32 GiB; one run with the GPU cache pinned to 81,376 tokens |
 | The move to vLLM 0.29.0 (*What happens when a container is overloaded*) | one `g7e.2xlarge` in ap-south-1 | 30B MoE fp8, plain and with EAGLE-3, both engines on the same host; on 0.29.0 against earlier 0.28.0 rows: dense 32B fp8, 120B MXFP4 (also both engines), Gemma 4 26B NVFP4 and 12B W4A16; the 30B quality suite | the single-engine matrix, 8 to 64 in flight; overload at 64 to 512 with and without `--max-num-queued-reqs`; same kernels chosen on both engines, most rows within 5%, none beyond 11%, quality scores within one standard error |
+
+| Large models on Capacity Blocks, vLLM 0.30.0 (*Topology*, *Speculative decoding*, *NVFP4*, *Image inputs*, *Engine tuning*) | one `p6-b200.48xlarge` (8 × B200), one `p5.48xlarge` (8 × H100) | DeepSeek-V4 Flash and Pro, GLM-5.3 and GLM-5.3-Flash, Kimi-K2.6, MiniMax-M2.7, Qwen3.8-Flash-Next, Qwen3-Coder-480B, Step-3.7-Flash; Qwen3-30B, Qwen3-235B and gpt-oss-120b repeated | same matrix, 64 to 512 per host; long prompts to 32k unique and cached; image inputs at 16 to 128 |
 
 Run-to-run noise, measured by repeating configurations: an eight-engine H100 host reproduced every row
 within ±2% back to back and across two days and two regions, and the same configuration on another
