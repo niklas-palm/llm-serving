@@ -900,7 +900,7 @@ TP=4 measured +52 to +54% on 4k unique prompts at 256 to 512 in flight, and 0.85
 the cache is the limit; keep tensor parallelism for cached, low-concurrency or decode-bound traffic.**
 The capacity gain is the mechanism above. Why long unique prompts gain even where capacity does not bind
 is not established: it is not the duplicated cache reads under TP, because with the same prompts cached
-DP lost. The gain is in prefill.
+DP lost. So the gain is on the prefill side, and its mechanism is open.
 
 #### When the model needs several GPUs: the smallest degree that fits, then replicas
 
@@ -984,7 +984,7 @@ For throughput, in order:
 replicas) at concurrency 256, cached and uncached, on this GPU. On eight H100s (`p5.48xlarge`): eight
 engines at TP=1 with models that fit one GPU, and a 235B mixture-of-experts that does not, as 2 × TP=4,
 1 × TP=8 and DP=2 × TP=4, with and without expert parallelism (*Topology*). On eight B200s
-(`p6-b200.48xlarge`) and eight H100s, through Capacity Blocks on vLLM 0.30.0: models from 230B to 1.6T
+(`p6-b200.48xlarge`) and eight H100s, through Capacity Blocks on vLLM 0.30.0: models from about 180B to 1.6T
 (DeepSeek-V4 Flash and Pro, GLM-5.3 and GLM-5.3-Flash, Kimi-K2.6, MiniMax-M2.7, Qwen3.8-Flash-Next,
 Qwen3-Coder-480B, Step-3.7-Flash) at TP=2 to TP=8, with and without expert and data parallelism.
 
@@ -1586,8 +1586,8 @@ seven draft tokens), the same layout on eight B200s and on eight H100s, vLLM 0.3
 | 8 × B200 | +115% | 0% | +48 to +124% (64 to 512 in flight) |
 | 8 × H100 | +90% | **−34%** | **−17%** |
 
-The H100 has about half the B200's tensor throughput, so the same drafter that was free at full load on
-one cost a third on the other.
+The H100 has about half the B200's tensor throughput. Less spare compute, an earlier break-even: the
+rule above, on a third kind of drafter.
 
 ### N-gram speculative decoding: measured **−58%**
 

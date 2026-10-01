@@ -826,7 +826,7 @@ repeated baseline for the noise floor; a fourth family (Gemma 4: a 26B mixture-o
 an encoder-free 12B) in bf16, fp8, NVFP4 and the publisher's quantisation-aware int4, with its thinking
 mode, its multi-token-prediction drafter, the same engine on two releases, and on eight H100s its KV
 precision by attention kernel and TP=1, 2 and 4 over NVLink. On vLLM 0.30.0, through Capacity Blocks on eight B200s and eight H100s: nine models
-from 230B to 1.6T parameters at TP=2 to TP=8 with and without expert and data parallelism, MLA's
+from about 180B to 1.6T parameters at TP=2 to TP=8 with and without expert and data parallelism, MLA's
 KV cache under tensor and data parallelism, speculation by GPU, NVFP4 format against layout on B200, and
 image inputs. **Not measured:** autoscaling timings on fleets other than 6 → 8;
 eight engines on one g7e host and a single-GPU H100 instance (no capacity found for either); code quality of a base model over an API (the
