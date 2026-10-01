@@ -299,3 +299,17 @@ def test_quality_chat_loglik_wraps_prompts_in_the_chat_template_and_skips_wikite
     assert "--apply_chat_template" in calls[0] and "--num_fewshot" in calls[0], "the multiple-choice pass is wrapped"
     assert calls[1].count("--apply_chat_template") == 1, "the generative pass was already wrapped and is not doubled"
     assert q.loglik_tokenizer(a, "m") == "tokenized_requests=True,tokenizer=m", "no BOS copy: the template writes <bos>"
+
+
+def test_a_generated_image_is_a_valid_png_unique_unless_asked_to_repeat():
+    """The image mode measured the vision encoder: an image that does not decode, or a "unique" image that
+    repeats, would measure an error path or the prefix cache instead."""
+    import base64, struct, zlib
+    bench = _load("benchmark")
+    a, b = bench.image(64), bench.image(64)
+    assert a != b and bench.image(64, same=True) == bench.image(64, same=True)
+    png = base64.b64decode(a.split(",", 1)[1])
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    assert struct.unpack(">II", png[16:24]) == (64, 64)
+    idat_len = struct.unpack(">I", png[33:37])[0]
+    assert len(zlib.decompress(png[41:41 + idat_len])) == 64 * (1 + 64 * 3)
