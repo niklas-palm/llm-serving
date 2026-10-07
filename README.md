@@ -103,19 +103,21 @@ on-demand have separate quotas.**
 | All P Spot Instance Requests (p5, p6-b200) | `L-7212CCBC` | often 0 |
 | Running On-Demand P instances (p5, p6-b200) | `L-417A185B` | often 0 |
 
-| Instance | GPUs | VRAM | vCPU | Host RAM | Fits a 64 vCPU quota? |
-|---|---|---|---|---|---|
-| `g7e.2xlarge` | 1 | 96 GiB | 8 | 64 GiB | yes, **8 of them, exactly** |
-| `g7e.4xlarge` | 1 | 96 GiB | 16 | 128 GiB | yes, 4 |
-| `g7e.8xlarge` | 1 | 96 GiB | 32 | 256 GiB | yes, 2 |
-| `g7e.12xlarge` | 2 | 192 GiB | 48 | 512 GiB | yes, 1 |
-| `g7e.24xlarge` | 4 | 384 GiB | 96 | 1 TiB | **no**, needs 96 |
-| `g7e.48xlarge` | 8 | 768 GiB | 192 | 2 TiB | **no**, needs 192 |
-| `p5.4xlarge` / `p5.48xlarge` | 1 / 8 x H100 80 GiB | 80 GiB / 640 GiB | 16 / 192 | 256 GiB / 2 TiB | separate P quotas; for comparison runs, not the measured platform |
-| `p6-b200.48xlarge` | 8 x B200 179 GiB | 1,432 GiB | 192 | 2 TiB | separate P quotas; usually a Capacity Block |
+Quotas count vCPU, so the number you need is vCPU per instance times instance count:
 
-The shipped default of 16 needs 128 vCPU; eight fit the 64 vCPU default quota exactly. Anything larger needs an
-increase a new account will not have.
+| Instance | GPUs | GPU memory | vCPU | Host RAM | Quota family |
+|---|---|---|---|---|---|
+| `g7e.2xlarge` | 1 × RTX PRO 6000 | 96 GiB | 8 | 64 GiB | G |
+| `g7e.4xlarge` | 1 × RTX PRO 6000 | 96 GiB | 16 | 128 GiB | G |
+| `g7e.8xlarge` | 1 × RTX PRO 6000 | 96 GiB | 32 | 256 GiB | G |
+| `g7e.12xlarge` | 2 × RTX PRO 6000 | 192 GiB | 48 | 512 GiB | G |
+| `g7e.24xlarge` | 4 × RTX PRO 6000 | 384 GiB | 96 | 1 TiB | G |
+| `g7e.48xlarge` | 8 × RTX PRO 6000 | 768 GiB | 192 | 2 TiB | G |
+| `p5.4xlarge` | 1 × H100 | 80 GiB | 16 | 256 GiB | P |
+| `p5.48xlarge` | 8 × H100 | 640 GiB | 192 | 2 TiB | P |
+| `p6-b200.48xlarge` | 8 × B200 | 1,432 GiB | 192 | 2 TiB | P |
+
+The shipped default of 16 `g7e.2xlarge` needs 128 vCPU of G quota.
 
 For p5 and p6-b200 the quota is rarely the obstacle; capacity is, and a Capacity Block (below) is the
 usual way in. **Otherwise check the quota that matches your `useSpot` setting**, or the stack succeeds and
