@@ -4,10 +4,14 @@ Deploy an open-weight LLM with [vLLM](https://github.com/vllm-project/vllm) on A
 a load balancer, with an OpenAI-compatible API.
 
 Any model vLLM serves: `modelId` is a Hugging Face repo id, and the stack derives the GPUs per engine
-from the model's size. It has served thirteen models from 8B to 235B, dense, mixture-of-experts and
-hybrid, in bf16, fp8 and five 4-bit formats, on one GPU and on eight; the table in [Configure](#configure)
-lists them with the one or two settings each needed beyond `modelId`. The shipped default is one of
-them, chosen because it fits one GPU with room for a large cache.
+from the model's size. It has served over twenty models from 8B to 1.6T parameters, dense,
+mixture-of-experts and hybrid, in bf16, fp8 and five 4-bit formats, on one GPU and on eight; the table in
+[Configure](#configure) lists them with the settings each needed beyond `modelId`.
+
+Three GPU families: **g7e** (RTX PRO 6000 Blackwell, 96 GB, one to eight GPUs) is the default and where most
+measurements were made; **p5** (H100, 80 GB) and **p6-b200** (B200, 179 GB, eight GPUs) run the models
+that need several large GPUs, usually bought as a [Capacity Block](#capacity-blocks). The shipped default
+is a model that fits one g7e GPU with room for a large cache.
 
 This is a vLLM deployment, not a generic container host. The entrypoint turns the config keys into vLLM
 flags, the tuning doc measures vLLM settings, and the dashboard reads vLLM's own metrics (queue depth,
@@ -19,14 +23,16 @@ One CDK stack, one config file. You get an endpoint serving the **Responses API*
 
 ```
   HTTPS + Bearer key                   VPC origin      internal      ECS service (1..N engines)
-  ────────────────►  CloudFront  ───────────────────►  ALB  ──────►  on g7e GPU instances, running vLLM
+  ────────────────►  CloudFront  ───────────────────►  ALB  ──────►  on GPU instances, running vLLM
 ```
 
-The defaults come from measurements on this hardware; [docs/tuning.md](docs/tuning.md) has the numbers.
+The defaults come from measurements on this hardware; [docs/tuning.md](docs/tuning.md) has the numbers and
+says which GPU each was measured on.
 [docs/troubleshooting.md](docs/troubleshooting.md) is organised by symptom.
 
 **What it costs:** one `g7e.2xlarge` is about $3.30/hour on-demand, the shipped 16 about $53/hour;
-idle at zero instances about $60/month. Details and how to stop paying: [Operating](#operating).
+idle at zero instances about $60/month. An 8-GPU p5 or p6-b200 costs many times one g7e per hour, usually
+prepaid for the length of a Capacity Block. Details and how to stop paying: [Operating](#operating).
 
 ---
 
@@ -92,8 +98,10 @@ on-demand have separate quotas.**
 
 | Quota | Code | Typical default |
 |---|---|---|
-| All G and VT Spot Instance Requests | `L-3819A6DF` | **64 vCPU** |
-| Running On-Demand G and VT instances | `L-DB2E81BA` | 64–768 vCPU (varies) |
+| All G and VT Spot Instance Requests (g7e) | `L-3819A6DF` | **64 vCPU** |
+| Running On-Demand G and VT instances (g7e) | `L-DB2E81BA` | 64–768 vCPU (varies) |
+| All P Spot Instance Requests (p5, p6-b200) | `L-7212CCBC` | often 0 |
+| Running On-Demand P instances (p5, p6-b200) | `L-417A185B` | often 0 |
 
 | Instance | GPUs | VRAM | vCPU | Host RAM | Fits a 64 vCPU quota? |
 |---|---|---|---|---|---|
@@ -109,8 +117,9 @@ on-demand have separate quotas.**
 The shipped default of 16 needs 128 vCPU; eight fit the 64 vCPU default quota exactly. Anything larger needs an
 increase a new account will not have.
 
-**Check the quota that matches your `useSpot` setting**, or the stack succeeds and no instance ever
-launches:
+For p5 and p6-b200 the quota is rarely the obstacle; capacity is, and a Capacity Block (below) is the
+usual way in. **Otherwise check the quota that matches your `useSpot` setting**, or the stack succeeds and
+no instance ever launches:
 
 ```bash
 # useSpot: false (the shipped default) -> on-demand quota
@@ -135,7 +144,8 @@ Requests of roughly +50% over the current value are most likely to be approved a
 ### Check for capacity
 
 Quota and offerings say what you are allowed to launch, not what exists right now. On-demand g7e has had
-no capacity in whole regions for hours at a time, and nothing tells you in advance. Spot has a signal:
+no capacity in whole regions for hours at a time, and nothing tells you in advance. The eight-GPU H100 and
+B200 runs behind the docs used spot or a Capacity Block. Spot has a signal:
 
 ```bash
 aws ec2 get-spot-placement-scores --region <region> --region-names <region> \
@@ -234,6 +244,26 @@ measured default. Sizes are the checkpoint's, GPUs are per engine:
 | `google/gemma-4-26B-A4B-it` | MoE, 3.8B active, hybrid sliding/global attention | 1 | bf16, Red Hat fp8, NVIDIA NVFP4 | `toolCallParser: gemma4` and `reasoningParser: gemma4`, the second even with thinking off (*Tool calling*); with the Red Hat, NVIDIA or Google builds `quantization: ""` (they declare their own method and the load-time flag conflicts: troubleshooting *does not match the quantization*); Apache-2.0, no token needed |
 | `google/gemma-4-31B-it` | dense, hybrid attention | 1 | bf16, Red Hat fp8, Google QAT W4A16, NVIDIA NVFP4 | as above; in bf16 also `maxModelLen: 131072`: its 262k context does not fit next to 62 GB of weights on a 96 GB card (*Will my model fit?*) |
 | `google/gemma-4-12B-it` | dense, encoder-free multimodal | 1 | bf16, Red Hat fp8, Google QAT W4A16 | as above |
+
+Served on eight H100s or eight B200s with vLLM 0.30.0 (set `FROM vllm/vllm-openai:v0.30.0` in
+`container/Dockerfile` and the matching `TAG` in `scripts/build_image.py`; the shipped 0.29.0 was not tried
+with these). Give all of them `extraEnv: {VLLM_ENGINE_READY_TIMEOUT_S: "1200"}` (troubleshooting, *never
+becomes ready*):
+
+| Model | Kind | GPUs | Formats served | Beyond `modelId` |
+|---|---|---|---|---|
+| `deepseek-ai/DeepSeek-V4-Flash-0731` | MLA MoE, sparse attention | 4 per engine | publisher (fp8, MXFP4 experts); NVIDIA's NVFP4 build failed on the recipe's MoE kernel | `extraArgs: --trust-remote-code --tokenizer-mode deepseek_v4 --block-size 256`; parsers `deepseek_v4`; `dataParallel: 4` with `enableExpertParallel` for long prompts (*The exception: MLA models*), at 0.90 on H100; its DSpark drafter is one `--speculative-config` (*How speculative decoding works*) |
+| `deepseek-ai/DeepSeek-V4-Pro-0813` | MLA MoE, 1.6T | 8 (B200) | publisher | as Flash, `dataParallel: 8`, `maxModelLen: 24576`; use the dated repo, the undated one has no DSpark drafter |
+| `zai-org/GLM-5.3` | MoE, 753 GB fp8 | 8 fp8, 4 NVFP4 (B200) | publisher fp8, NVIDIA NVFP4 | parsers `glm47`; it always thinks |
+| `zai-org/GLM-5.3-Flash` | MoE | 2 to 8 | publisher fp8, NVIDIA NVFP4 | parsers `glm47`; on H100 TP=8 and `kvCacheDtype: auto` (the recipe: no fp8 KV on Hopper); it always thinks |
+| `moonshotai/Kimi-K2.6` | MoE, 1T, native INT4 | 4 or 8 (B200) | INT4 | `extraArgs: --trust-remote-code --default-chat-template-kwargs '{"thinking": false}'` for thinking off; parsers `kimi_k2`; `kvCacheDtype: auto`; does not fit 8 × H100 at 32k |
+| `MiniMaxAI/MiniMax-M2.7` | MoE | 2 (B200), 4 (H100) | publisher fp8 | `extraArgs: --trust-remote-code`; parsers `minimax_m2` |
+| `Qwen/Qwen3.8-Flash-Next-FP8` | hybrid MoE, multimodal | 4 or 8 (H100) | publisher fp8 | `kvCacheDtype: auto` (refuses fp8), `gpuMemoryUtilization: 0.85`, `enableExpertParallel`, `extraEnv: {VLLM_PLE_CPU_OFFLOAD: "1"}`, `extraArgs: --moe-backend triton --no-enable-flashinfer-autotune`; parsers `qwen3_coder` / `qwen3` |
+| `Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8` | MoE, 35B active | 8 (H100) | publisher fp8 | `maxModelLen: 32768`; `toolCallParser: qwen3_coder` |
+| `stepfun-ai/Step-3.7-Flash-FP8` | MoE | 4 (H100) | publisher fp8 | `extraArgs: --trust-remote-code`; parsers `step3p5` |
+
+`XiaomiMiMo/MiMo-V2.6-Flash-RL` (fp8) does not load on vLLM 0.27 to 0.30; the fix (vllm#57508, #58142) is
+on vLLM's main branch.
 
 Formats, kernels and what each one costs in throughput and in answers are in *Choosing a model to host*,
 *Quantisation is two independent decisions* and the two quality sections of
