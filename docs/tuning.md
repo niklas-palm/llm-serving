@@ -2278,7 +2278,7 @@ and an alarm in `INSUFFICIENT_DATA` every quiet hour is an alarm nobody reads.
 | Alarm | Fires on | Why that delay |
 |---|---|---|
 | `<stack>-too-slow` (only if `latencyAlarmSeconds` is set) | p95 above it for 3 minutes | One minute over budget is what a task starting or draining looks like. A fleet that cannot grow faster than ~11 minutes gains nothing from being told sooner. |
-| `<stack>-engines-unhealthy` | any unhealthy target for 15 minutes | A fresh instance is unhealthy for about 7 minutes while it pulls the image and loads weights (14 from launch to healthy). A 5-minute window fired on every first deploy. |
+| `<stack>-engines-unhealthy` | any unhealthy target for 15 minutes; 45 when the weights exceed 100 GiB | A fresh instance is unhealthy for about 7 minutes while it pulls the image and loads weights (14 from launch to healthy). A 5-minute window fired on every first deploy. Large models start for longer: on eight B200s and H100s the 15-minute window fired on about half the deploys of 167 to 893 GB models, all starts that went on to serve. |
 | `<stack>-load-balancer-erroring` | more than 10 ALB 5XX/min for 2 minutes | Not zero: a long prompt hitting the idle timeout produces a 504, and a deploy briefly has no healthy target. Sustained is what matters. |
 
 Each description says what the alarm means and what to check.

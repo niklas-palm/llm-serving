@@ -1092,16 +1092,20 @@ service:
         # harder to read in the console and in `describe-alarms`. Label for widgets, not for alarms.
         #
         # The descriptions are written to be read on a phone by someone who did not deploy this.
+        # Large models start for longer than 15 minutes: weights, then kernel compilation and graph
+        # capture. On eight B200s and eight H100s (models of 167 to 893 GB) the 15-minute window fired on
+        # about half the deploys, all of them starts that went on to serve. Over 100 GiB of weights, 45.
+        unhealthy_minutes = 45 if est_weight_bytes > 100 * 2**30 else 15
         alarms = [
             tg_metrics.unhealthy_host_count(period=minute).create_alarm(
                 self, "UnhealthyTargetsAlarm",
                 alarm_name=f"{self.stack_name}-engines-unhealthy",
                 alarm_description=(
-                    f"At least one engine has been failing its health check for 15 minutes "
+                    f"At least one engine has been failing its health check for {unhealthy_minutes} minutes "
                     f"({tasks} should be healthy). Normal during a deploy while weights load; "
                     f"otherwise the container is crashing - check the task's logs in "
                     f"{log_group.log_group_name}."),
-                threshold=0, evaluation_periods=15,
+                threshold=0, evaluation_periods=unhealthy_minutes,
                 comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
                 # Fifteen minutes, because a starting task is legitimately unhealthy while it pulls the
                 # image and loads tens of GiB of weights. Measured on a fresh instance with a cold cache:
