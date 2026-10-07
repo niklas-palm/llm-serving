@@ -1446,3 +1446,15 @@ def test_dev_shm_is_half_the_container_memory_with_an_8_gib_floor():
     small = [r["Properties"] for r in synth(instanceType="g7e.2xlarge")["Resources"].values()
              if r["Type"] == "AWS::ECS::TaskDefinition"][0]["ContainerDefinitions"]
     assert next(c for c in small if c["Name"] == "vllm")["LinuxParameters"]["SharedMemorySize"] == 19660
+
+
+def test_a_large_model_gets_a_longer_unhealthy_window_so_a_normal_start_does_not_alarm():
+    """At 15 minutes the alarm fired on about half the deploys of 167-893 GB models on eight B200s and
+    H100s, every one a start that went on to serve."""
+    def window(t):
+        return next(a["Properties"]["EvaluationPeriods"] for a in t["Resources"].values()
+                    if a["Type"] == "AWS::CloudWatch::Alarm"
+                    and a["Properties"]["AlarmName"].endswith("engines-unhealthy"))
+    assert window(synth()) == 15
+    assert window(synth(instanceType="p5.48xlarge", estimatedParamsBillions=291, instanceCount=1,
+                        maxInstanceCount=1)) == 45
