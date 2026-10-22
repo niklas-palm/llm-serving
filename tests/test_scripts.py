@@ -95,6 +95,32 @@ def test_a_size_list_is_a_per_request_mix(monkeypatch):
     assert {round(n, -2) for n, _ in seen} == {100, 1000} and {o for _, o in seen} == {50, 800}
 
 
+def test_ignore_eos_asks_for_the_full_output_length(monkeypatch):
+    """Llama 3.1 answered the unique prompt in 15 tokens and looked 4x faster than models that ran to the cap;
+    --ignore-eos must reach the request body, and only when asked."""
+    import multiprocessing as mp
+    bench = _load("benchmark")
+    seen = []
+
+    class Resp:
+        status_code = 200
+        def json(self): return {"usage": {"input_tokens": 1, "output_tokens": 1}}
+
+    class Session:
+        def __init__(self): self.headers = {}
+        def post(self, url, json, timeout):
+            seen.append(json.get("ignore_eos")); return Resp()
+
+    monkeypatch.setattr(bench.requests, "Session", Session)
+    monkeypatch.setattr("signal.signal", lambda *a: None)
+    for flag in (True, False):
+        seen.clear(); q = mp.Queue()
+        bench.worker("http://u", "k", "m", conc=1, in_tok=[10], out_tok=[5], seconds=0.05, shared=True, q=q,
+                     ignore_eos=flag)
+        q.get(timeout=5)
+        assert seen and set(seen) == ({True} if flag else {None})
+
+
 def test_a_level_drains_its_in_flight_requests_and_counts_only_the_window(monkeypatch):
     """Exiting with requests open left the engine generating them behind CloudFront, and the next level
     started behind that backlog. The worker now waits for them and does not count the late ones."""

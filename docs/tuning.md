@@ -2035,7 +2035,10 @@ see *Choosing an operating concurrency*.
 `scripts/test_endpoint.py` is a smoke test: it shows the endpoint holds up, not where its ceiling is.
 `scripts/benchmark.py` does the sweep above: multi-process, warm-up first, aggregate and per-request
 numbers from the same run, unique prompts unless you pass `--shared-prefix`, time to first token and
-goodput with `--stream` and `--budget-seconds`, conversations with `--turns`.
+goodput with `--stream` and `--budget-seconds`, conversations with `--turns`. Compare models with
+`--ignore-eos`: every request then generates its full output length. Without it the model decides when to
+stop, and req/s rewards short answers: Llama 3.1 8B answered the unique 1k prompt in 15 tokens and looked 4x
+faster than models that ran to 190. Check output tokens per request before comparing any two rows.
 
 ---
 
