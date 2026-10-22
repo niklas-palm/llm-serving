@@ -21,6 +21,8 @@ so sticky routing is honoured; --schema asks for structured JSON; --reasoning-ef
 model's effort. A comma-separated --input-tokens or --output-tokens is a mix, each request drawing one.
 --images N puts N generated images (--image-px square) before the text of each request, over
 /v1/chat/completions, unique per request unless --same-image; the input token count then includes them.
+--ignore-eos makes every request generate exactly its output tokens (vLLM's ignore_eos), so engines and models
+are compared on the same work; without it a model that answers in 15 tokens looks many times faster.
 
 Three things the script does that the numbers depend on, each with its measurement in docs/tuning.md
 (*If you are benchmarking this yourself* and *Two things about measuring itself*): prompts are unique by default, a nonce up front defeating the
@@ -87,11 +89,13 @@ def image(side: int, same: bool = False) -> str:
 
 
 def ask_images(sess, url: str, model: str, text: str, max_out: int,
-               images: list[str]) -> tuple[float, float, int, int, str]:
+               images: list[str], ignore_eos: bool = False) -> tuple[float, float, int, int, str]:
     """One request with images first, over Chat Completions (the Responses API takes no images here)."""
     content = [{"type": "image_url", "image_url": {"url": u}} for u in images] + [{"type": "text", "text": text}]
     body = {"model": model, "max_tokens": max_out, "temperature": 0.0,
             "messages": [{"role": "user", "content": content}]}
+    if ignore_eos:
+        body["ignore_eos"] = True
     t0 = time.perf_counter()
     r = sess.post(f"{url}/v1/chat/completions", json=body, timeout=300)
     dt = time.perf_counter() - t0
@@ -104,7 +108,7 @@ def ask_images(sess, url: str, model: str, text: str, max_out: int,
 
 
 def ask(sess, url: str, model: str, text: str, max_out: int, stream: bool, schema: bool = False,
-        effort: str = "") -> tuple[float, float, int, int, str]:
+        effort: str = "", ignore_eos: bool = False) -> tuple[float, float, int, int, str]:
     """One request. Returns (latency, time to first token, input tokens, output tokens, answer text).
     Time to first token is 0 without streaming. Raises on anything but a well-formed answer."""
     body = {"model": model, "input": text, "max_output_tokens": max_out, "temperature": 0.0}
@@ -112,6 +116,8 @@ def ask(sess, url: str, model: str, text: str, max_out: int, stream: bool, schem
         body["text"] = {"format": {"type": "json_schema", "name": "order", "strict": True, "schema": SCHEMA}}
     if effort:
         body["reasoning"] = {"effort": effort}
+    if ignore_eos:
+        body["ignore_eos"] = True
     t0 = time.perf_counter()
     if not stream:
         r = sess.post(f"{url}/v1/responses", json=body, timeout=300)
@@ -150,7 +156,7 @@ def ask(sess, url: str, model: str, text: str, max_out: int, stream: bool, schem
 def worker(url: str, key: str, model: str, conc: int, in_tok: list[int], out_tok: list[int],
            seconds: float, shared: bool, q: mp.Queue, stream: bool = False, turns: int = 1,
            budget: float = 0.0, schema: bool = False, effort: str = "", images: int = 0, image_px: int = 1024,
-           same_image: bool = False) -> None:
+           same_image: bool = False, ignore_eos: bool = False) -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)   # the parent handles Ctrl-C and terminates us
 
     stop = threading.Event()
@@ -190,10 +196,10 @@ def worker(url: str, key: str, model: str, conc: int, in_tok: list[int], out_tok
                     if images:
                         dt, ttft, used_in, used_out, answer = ask_images(
                             sess, url, model, text, random.choice(out_tok),
-                            fixed or [image(image_px) for _ in range(images)])
+                            fixed or [image(image_px) for _ in range(images)], ignore_eos)
                     else:
                         dt, ttft, used_in, used_out, answer = ask(sess, url, model, text, random.choice(out_tok),
-                                                                  stream, schema, effort)
+                                                                  stream, schema, effort, ignore_eos)
                 except (requests.RequestException, ValueError, AttributeError, TypeError, KeyError):
                     # A body that is not the promised shape is a failure too. Left uncaught, it killed
                     # the thread silently and the row reported a plausible number at lower concurrency.
@@ -229,7 +235,7 @@ def run_level(a: argparse.Namespace, model: str, total: int) -> dict:
     procs = [mp.Process(target=worker, args=(a.url, a.key, model, n, a.input_tokens, a.output_tokens,
                                              a.seconds, a.shared_prefix, q, a.stream, a.turns,
                                              a.budget_seconds, a.schema, a.reasoning_effort, a.images, a.image_px,
-                                             a.same_image)) for n in per_proc]
+                                             a.same_image, a.ignore_eos)) for n in per_proc]
     for p in procs:
         p.start()
     # A worker killed by the OS (OOM) would leave a bare q.get() waiting forever; the level, the drain
@@ -309,6 +315,8 @@ def main() -> int:
     ap.add_argument("--image-px", type=int, default=1024, help="side of each square image, in pixels")
     ap.add_argument("--same-image", action="store_true",
                     help="the same image in every request, so it can be a cached prefix")
+    ap.add_argument("--ignore-eos", action="store_true",
+                    help="every request generates exactly its output tokens (same work for every model)")
     ap.add_argument("--json", action="store_true", help="also print one JSON line per level")
     a = ap.parse_args()
     a.url = a.url.rstrip("/")
