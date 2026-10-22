@@ -21,6 +21,7 @@ so sticky routing is honoured; --schema asks for structured JSON; --reasoning-ef
 model's effort. A comma-separated --input-tokens or --output-tokens is a mix, each request drawing one.
 --images N puts N generated images (--image-px square) before the text of each request, over
 /v1/chat/completions, unique per request unless --same-image; the input token count then includes them.
+--chat sends /v1/chat/completions instead of /v1/responses, for gateways and routers that serve only chat.
 --ignore-eos makes every request generate exactly its output tokens (vLLM's ignore_eos), so engines and models
 are compared on the same work; without it a model that answers in 15 tokens looks many times faster.
 
@@ -153,10 +154,48 @@ def ask(sess, url: str, model: str, text: str, max_out: int, stream: bool, schem
     return dt, ttft, int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0), "".join(parts)
 
 
+def ask_chat(sess, url: str, model: str, text: str, max_out: int, stream: bool,
+             ignore_eos: bool = False) -> tuple[float, float, int, int, str]:
+    """ask() over /v1/chat/completions: the same returns, for endpoints that serve only chat (a disaggregated-serving
+    proxy, some gateways). Streaming asks for usage in the last chunk."""
+    body = {"model": model, "messages": [{"role": "user", "content": text}], "max_tokens": max_out, "temperature": 0.0}
+    if ignore_eos:
+        body["ignore_eos"] = True
+    t0 = time.perf_counter()
+    if not stream:
+        r = sess.post(f"{url}/v1/chat/completions", json=body, timeout=300)
+        dt = time.perf_counter() - t0
+        if r.status_code != 200:
+            raise ValueError(f"status {r.status_code}")
+        d = r.json()
+        u = d.get("usage") or {}
+        return (dt, 0.0, int(u.get("prompt_tokens") or 0), int(u.get("completion_tokens") or 0),
+                d["choices"][0]["message"]["content"] or "")
+    body.update(stream=True, stream_options={"include_usage": True})
+    ttft, usage, parts = 0.0, {}, []
+    with sess.post(f"{url}/v1/chat/completions", json=body, timeout=300, stream=True) as r:
+        if r.status_code != 200:
+            raise ValueError(f"status {r.status_code}")
+        for line in r.iter_lines():
+            if not line.startswith(b"data: ") or line == b"data: [DONE]":
+                continue
+            ev = json.loads(line[6:])
+            for c in ev.get("choices") or []:
+                delta = c.get("delta") or {}
+                if (delta.get("content") or delta.get("reasoning_content")) and not ttft:
+                    ttft = time.perf_counter() - t0
+                parts.append(delta.get("content") or "")
+            usage = ev.get("usage") or usage
+    dt = time.perf_counter() - t0
+    if not usage:
+        raise ValueError("stream ended without usage")
+    return dt, ttft, int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0), "".join(parts)
+
+
 def worker(url: str, key: str, model: str, conc: int, in_tok: list[int], out_tok: list[int],
            seconds: float, shared: bool, q: mp.Queue, stream: bool = False, turns: int = 1,
            budget: float = 0.0, schema: bool = False, effort: str = "", images: int = 0, image_px: int = 1024,
-           same_image: bool = False, ignore_eos: bool = False) -> None:
+           same_image: bool = False, ignore_eos: bool = False, chat: bool = False) -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)   # the parent handles Ctrl-C and terminates us
 
     stop = threading.Event()
@@ -197,6 +236,9 @@ def worker(url: str, key: str, model: str, conc: int, in_tok: list[int], out_tok
                         dt, ttft, used_in, used_out, answer = ask_images(
                             sess, url, model, text, random.choice(out_tok),
                             fixed or [image(image_px) for _ in range(images)], ignore_eos)
+                    elif chat:
+                        dt, ttft, used_in, used_out, answer = ask_chat(sess, url, model, text, random.choice(out_tok),
+                                                                       stream, ignore_eos)
                     else:
                         dt, ttft, used_in, used_out, answer = ask(sess, url, model, text, random.choice(out_tok),
                                                                   stream, schema, effort, ignore_eos)
@@ -235,7 +277,7 @@ def run_level(a: argparse.Namespace, model: str, total: int) -> dict:
     procs = [mp.Process(target=worker, args=(a.url, a.key, model, n, a.input_tokens, a.output_tokens,
                                              a.seconds, a.shared_prefix, q, a.stream, a.turns,
                                              a.budget_seconds, a.schema, a.reasoning_effort, a.images, a.image_px,
-                                             a.same_image, a.ignore_eos)) for n in per_proc]
+                                             a.same_image, a.ignore_eos, a.chat)) for n in per_proc]
     for p in procs:
         p.start()
     # A worker killed by the OS (OOM) would leave a bare q.get() waiting forever; the level, the drain
@@ -315,6 +357,8 @@ def main() -> int:
     ap.add_argument("--image-px", type=int, default=1024, help="side of each square image, in pixels")
     ap.add_argument("--same-image", action="store_true",
                     help="the same image in every request, so it can be a cached prefix")
+    ap.add_argument("--chat", action="store_true",
+                    help="use /v1/chat/completions instead of /v1/responses (for endpoints that serve only chat)")
     ap.add_argument("--ignore-eos", action="store_true",
                     help="every request generates exactly its output tokens (same work for every model)")
     ap.add_argument("--json", action="store_true", help="also print one JSON line per level")

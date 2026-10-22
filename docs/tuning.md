@@ -2038,7 +2038,8 @@ numbers from the same run, unique prompts unless you pass `--shared-prefix`, tim
 goodput with `--stream` and `--budget-seconds`, conversations with `--turns`. Compare models with
 `--ignore-eos`: every request then generates its full output length. Without it the model decides when to
 stop, and req/s rewards short answers: Llama 3.1 8B answered the unique 1k prompt in 15 tokens and looked 4x
-faster than models that ran to 190. Check output tokens per request before comparing any two rows.
+faster than models that ran to 190. Check output tokens per request before comparing any two rows. `--chat` sends
+`/v1/chat/completions` for endpoints that serve nothing else (a disaggregated-serving proxy, some gateways).
 
 ---
 

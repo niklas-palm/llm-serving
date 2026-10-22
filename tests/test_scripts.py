@@ -121,6 +121,31 @@ def test_ignore_eos_asks_for_the_full_output_length(monkeypatch):
         assert seen and set(seen) == ({True} if flag else {None})
 
 
+def test_chat_mode_posts_chat_completions_and_reads_its_usage(monkeypatch):
+    """A disaggregated-serving proxy routes only /v1/chat/completions: every /v1/responses request failed (Trainium N2).
+    --chat must post there, with messages, and count prompt/completion tokens from its usage."""
+    import multiprocessing as mp
+    bench = _load("benchmark")
+    seen = []
+
+    class Resp:
+        status_code = 200
+        def json(self): return {"usage": {"prompt_tokens": 11, "completion_tokens": 7},
+                                "choices": [{"message": {"content": "ok"}}]}
+
+    class Session:
+        def __init__(self): self.headers = {}
+        def post(self, url, json, timeout):
+            seen.append((url.rsplit("/v1/", 1)[1], "messages" in json)); return Resp()
+
+    monkeypatch.setattr(bench.requests, "Session", Session)
+    monkeypatch.setattr("signal.signal", lambda *a: None)
+    q = mp.Queue()
+    bench.worker("http://u", "k", "m", conc=1, in_tok=[10], out_tok=[5], seconds=0.05, shared=True, q=q, chat=True)
+    r = q.get(timeout=5)
+    assert seen and set(seen) == {("chat/completions", True)} and r["ok"] > 0 and r["out"] == 7 * r["ok"]
+
+
 def test_a_level_drains_its_in_flight_requests_and_counts_only_the_window(monkeypatch):
     """Exiting with requests open left the engine generating them behind CloudFront, and the next level
     started behind that backlog. The worker now waits for them and does not count the late ones."""
