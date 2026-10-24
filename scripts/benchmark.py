@@ -24,6 +24,7 @@ model's effort. A comma-separated --input-tokens or --output-tokens is a mix, ea
 --chat sends /v1/chat/completions instead of /v1/responses, for gateways and routers that serve only chat.
 --ignore-eos makes every request generate exactly its output tokens (vLLM's ignore_eos), so engines and models
 are compared on the same work; without it a model that answers in 15 tokens looks many times faster.
+--temperature and --top-p set sampling (default greedy, temperature 0), to measure what sampling costs an engine.
 
 Three things the script does that the numbers depend on, each with its measurement in docs/tuning.md
 (*If you are benchmarking this yourself* and *Two things about measuring itself*): prompts are unique by default, a nonce up front defeating the
@@ -90,10 +91,11 @@ def image(side: int, same: bool = False) -> str:
 
 
 def ask_images(sess, url: str, model: str, text: str, max_out: int,
-               images: list[str], ignore_eos: bool = False) -> tuple[float, float, int, int, str]:
+               images: list[str], ignore_eos: bool = False, temperature: float = 0.0,
+               top_p: float = 1.0) -> tuple[float, float, int, int, str]:
     """One request with images first, over Chat Completions (the Responses API takes no images here)."""
     content = [{"type": "image_url", "image_url": {"url": u}} for u in images] + [{"type": "text", "text": text}]
-    body = {"model": model, "max_tokens": max_out, "temperature": 0.0,
+    body = {"model": model, "max_tokens": max_out, "temperature": temperature, "top_p": top_p,
             "messages": [{"role": "user", "content": content}]}
     if ignore_eos:
         body["ignore_eos"] = True
@@ -109,10 +111,11 @@ def ask_images(sess, url: str, model: str, text: str, max_out: int,
 
 
 def ask(sess, url: str, model: str, text: str, max_out: int, stream: bool, schema: bool = False,
-        effort: str = "", ignore_eos: bool = False) -> tuple[float, float, int, int, str]:
+        effort: str = "", ignore_eos: bool = False, temperature: float = 0.0,
+        top_p: float = 1.0) -> tuple[float, float, int, int, str]:
     """One request. Returns (latency, time to first token, input tokens, output tokens, answer text).
     Time to first token is 0 without streaming. Raises on anything but a well-formed answer."""
-    body = {"model": model, "input": text, "max_output_tokens": max_out, "temperature": 0.0}
+    body = {"model": model, "input": text, "max_output_tokens": max_out, "temperature": temperature, "top_p": top_p}
     if schema:
         body["text"] = {"format": {"type": "json_schema", "name": "order", "strict": True, "schema": SCHEMA}}
     if effort:
@@ -155,10 +158,11 @@ def ask(sess, url: str, model: str, text: str, max_out: int, stream: bool, schem
 
 
 def ask_chat(sess, url: str, model: str, text: str, max_out: int, stream: bool,
-             ignore_eos: bool = False) -> tuple[float, float, int, int, str]:
+             ignore_eos: bool = False, temperature: float = 0.0, top_p: float = 1.0) -> tuple[float, float, int, int, str]:
     """ask() over /v1/chat/completions: the same returns, for endpoints that serve only chat (a disaggregated-serving
     proxy, some gateways). Streaming asks for usage in the last chunk."""
-    body = {"model": model, "messages": [{"role": "user", "content": text}], "max_tokens": max_out, "temperature": 0.0}
+    body = {"model": model, "messages": [{"role": "user", "content": text}], "max_tokens": max_out,
+            "temperature": temperature, "top_p": top_p}
     if ignore_eos:
         body["ignore_eos"] = True
     t0 = time.perf_counter()
@@ -195,7 +199,8 @@ def ask_chat(sess, url: str, model: str, text: str, max_out: int, stream: bool,
 def worker(url: str, key: str, model: str, conc: int, in_tok: list[int], out_tok: list[int],
            seconds: float, shared: bool, q: mp.Queue, stream: bool = False, turns: int = 1,
            budget: float = 0.0, schema: bool = False, effort: str = "", images: int = 0, image_px: int = 1024,
-           same_image: bool = False, ignore_eos: bool = False, chat: bool = False) -> None:
+           same_image: bool = False, ignore_eos: bool = False, chat: bool = False, temperature: float = 0.0,
+           top_p: float = 1.0) -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)   # the parent handles Ctrl-C and terminates us
 
     stop = threading.Event()
@@ -235,13 +240,13 @@ def worker(url: str, key: str, model: str, conc: int, in_tok: list[int], out_tok
                     if images:
                         dt, ttft, used_in, used_out, answer = ask_images(
                             sess, url, model, text, random.choice(out_tok),
-                            fixed or [image(image_px) for _ in range(images)], ignore_eos)
+                            fixed or [image(image_px) for _ in range(images)], ignore_eos, temperature, top_p)
                     elif chat:
                         dt, ttft, used_in, used_out, answer = ask_chat(sess, url, model, text, random.choice(out_tok),
-                                                                       stream, ignore_eos)
+                                                                       stream, ignore_eos, temperature, top_p)
                     else:
                         dt, ttft, used_in, used_out, answer = ask(sess, url, model, text, random.choice(out_tok),
-                                                                  stream, schema, effort, ignore_eos)
+                                                                  stream, schema, effort, ignore_eos, temperature, top_p)
                 except (requests.RequestException, ValueError, AttributeError, TypeError, KeyError):
                     # A body that is not the promised shape is a failure too. Left uncaught, it killed
                     # the thread silently and the row reported a plausible number at lower concurrency.
@@ -277,7 +282,7 @@ def run_level(a: argparse.Namespace, model: str, total: int) -> dict:
     procs = [mp.Process(target=worker, args=(a.url, a.key, model, n, a.input_tokens, a.output_tokens,
                                              a.seconds, a.shared_prefix, q, a.stream, a.turns,
                                              a.budget_seconds, a.schema, a.reasoning_effort, a.images, a.image_px,
-                                             a.same_image, a.ignore_eos, a.chat)) for n in per_proc]
+                                             a.same_image, a.ignore_eos, a.chat, a.temperature, a.top_p)) for n in per_proc]
     for p in procs:
         p.start()
     # A worker killed by the OS (OOM) would leave a bare q.get() waiting forever; the level, the drain
@@ -361,6 +366,9 @@ def main() -> int:
                     help="use /v1/chat/completions instead of /v1/responses (for endpoints that serve only chat)")
     ap.add_argument("--ignore-eos", action="store_true",
                     help="every request generates exactly its output tokens (same work for every model)")
+    ap.add_argument("--temperature", type=float, default=0.0,
+                    help="sampling temperature (default 0: greedy, so runs repeat; real traffic usually samples)")
+    ap.add_argument("--top-p", type=float, default=1.0, help="nucleus sampling top_p, with --temperature above 0")
     ap.add_argument("--json", action="store_true", help="also print one JSON line per level")
     a = ap.parse_args()
     a.url = a.url.rstrip("/")
@@ -377,6 +385,8 @@ def main() -> int:
     levels = sizes("--concurrency", a.concurrency)
     a.input_tokens = sizes("--input-tokens", a.input_tokens)
     a.output_tokens = sizes("--output-tokens", a.output_tokens)
+    if a.temperature < 0 or not 0 < a.top_p <= 1:
+        sys.exit("--temperature at least 0 and --top-p above 0 and at most 1")
     if a.processes < 1 or a.seconds <= 0 or a.warmup_seconds < 0 or a.turns < 1 or a.budget_seconds < 0:
         sys.exit("--processes and --turns at least 1, --seconds above 0, --warmup-seconds and --budget-seconds at least 0")
     if a.images < 0 or a.image_px < 32 or (a.images and (a.stream or a.schema or a.reasoning_effort)):
@@ -390,7 +400,8 @@ def main() -> int:
           f"{', streamed' if a.stream else ''}{', structured output' if a.schema else ''}"
           f"{f', reasoning effort {a.reasoning_effort}' if a.reasoning_effort else ''}"
           f"{f', {a.images} image(s) of {a.image_px} px per request' if a.images else ''}"
-          f"{' (the same each time)' if a.same_image and a.images else ''}, {a.seconds:g}s per level "
+          f"{' (the same each time)' if a.same_image and a.images else ''}"
+          f"{f', temperature {a.temperature:g}, top_p {a.top_p:g}' if a.temperature else ''}, {a.seconds:g}s per level "
           f"after {a.warmup_seconds:g}s warm-up, {a.processes} client processes\n")
 
     # Warm-up: the first requests pay for CUDA graph capture and kernel autotuning. Measuring from the

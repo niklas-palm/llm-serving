@@ -2040,6 +2040,8 @@ goodput with `--stream` and `--budget-seconds`, conversations with `--turns`. Co
 stop, and req/s rewards short answers: Llama 3.1 8B answered the unique 1k prompt in 15 tokens and looked 4x
 faster than models that ran to 190. Check output tokens per request before comparing any two rows. `--chat` sends
 `/v1/chat/completions` for endpoints that serve nothing else (a disaggregated-serving proxy, some gateways).
+Requests are greedy (temperature 0) by default, so runs repeat; `--temperature` and `--top-p` measure what
+sampling costs an engine, since most real traffic samples.
 
 ---
 
