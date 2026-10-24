@@ -277,6 +277,83 @@ def test_schema_and_reasoning_effort_land_in_the_request_body(monkeypatch):
     assert body["reasoning"] == {"effort": "low"}
 
 
+def test_poisson_arrivals_average_one_over_the_rate_with_random_gaps():
+    """Closed-loop req/s moved in waves when every request had the same length. Open-loop arrivals must come at
+    the asked rate on average, with exponential gaps (standard deviation equal to the mean), not on a fixed beat."""
+    import random
+    import statistics
+    bench = _load("benchmark")
+    times = bench.arrivals(5.0, 2000, random.Random(7))
+    gaps = [b - a for a, b in zip([0.0] + times, times)]
+    assert abs(statistics.mean(gaps) - 0.2) < 0.006, "mean gap is 1/rate"
+    assert 0.95 < statistics.stdev(gaps) / statistics.mean(gaps) < 1.05, "exponential, not evenly spaced"
+    assert times == sorted(times) and 0 < times[0] and times[-1] < 2000, "inside the window, in order"
+
+
+def test_rate_mode_counts_every_arrival_including_the_ones_that_finish_after_the_window(monkeypatch):
+    """Counting only the requests that finished inside the window would drop the slowest ones, and a server
+    falling behind the arrival rate would show a better p95 than it has."""
+    import multiprocessing as mp
+    import time
+    bench = _load("benchmark")
+    posts = []
+
+    class Resp:
+        status_code = 200
+        def json(self): return {"usage": {"input_tokens": 1, "output_tokens": 1}}
+
+    class Session:
+        def __init__(self): self.headers = {}
+        def post(self, *a, **k): posts.append(1); time.sleep(0.4); return Resp()
+
+    monkeypatch.setattr(bench.requests, "Session", Session)
+    monkeypatch.setattr("signal.signal", lambda *a: None)
+    q = mp.Queue()
+    bench.worker("http://u", "k", "m", conc=64, in_tok=[10], out_tok=[5], seconds=0.5, shared=True, q=q, rate=20)
+    r = q.get(timeout=5)
+    assert posts and r["ok"] == len(posts) and r["dropped"] == 0
+    assert r["wall"] >= 0.8, "the wall runs to the last completion, not the end of the window"
+
+
+def test_rate_level_reports_offered_rate_and_drops_above_the_in_flight_cap(monkeypatch):
+    """--rate adds the offered rate and the dropped count to a row; without --rate the row is unchanged."""
+    import threading
+    import time
+    from types import SimpleNamespace
+    bench = _load("benchmark")
+
+    class Resp:
+        status_code = 200
+        def json(self): return {"usage": {"input_tokens": 3, "output_tokens": 2}}
+
+    class Session:
+        def __init__(self): self.headers = {}
+        def post(self, *a, **k): time.sleep(0.2); return Resp()
+
+    monkeypatch.setattr(bench.requests, "Session", Session)
+    monkeypatch.setattr("signal.signal", lambda *a: None)
+    monkeypatch.setattr(bench.mp, "Process", threading.Thread)   # the fake session lives in this process
+    a = SimpleNamespace(url="http://u", key="k", input_tokens=[10], output_tokens=[5], seconds=1.0, shared_prefix=True,
+                        stream=False, turns=1, budget_seconds=0.0, schema=False, reasoning_effort="", images=0,
+                        image_px=1024, same_image=False, ignore_eos=False, chat=False, temperature=0.0, top_p=1.0,
+                        processes=2, rate=[50.0], max_in_flight=2)
+    row = bench.run_level(a, "m", 50.0)
+    assert row["rate"] == 50.0 and row["concurrency"] == 2, "the cap is the largest --concurrency"
+    assert row["dropped"] > 0 and 0 < row["rps"] <= 10.5, "two in flight at 0.2 s each hold at most 10 req/s"
+    assert row["failed"] == 0 and row["p50"] >= 0.2 and row["output_tokens_per_request"] == 2
+    a.rate = []
+    closed = bench.run_level(a, "m", 2)
+    assert "rate" not in closed and "dropped" not in closed
+
+
+def test_rate_must_be_numbers_above_zero():
+    import subprocess
+    for raw, msg in (("0", "above 0"), ("2,-1", "above 0"), ("fast", "comma-separated numbers")):
+        r = subprocess.run([sys.executable, os.path.join(SCRIPTS, "benchmark.py"), "http://127.0.0.1:9", "--key", "k",
+                            "--rate", raw], capture_output=True, text=True)
+        assert r.returncode == 1 and msg in r.stderr, r.stderr
+
+
 def test_size_fleet_rounds_up_and_prices_per_million_tokens():
     sf = _load("size_fleet")
     p = sf.plan(engine_rps=12.8, demand_rps=70, price_per_hour=5.85, gpus_per_instance=1,

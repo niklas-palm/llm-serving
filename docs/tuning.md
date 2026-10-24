@@ -2043,6 +2043,18 @@ faster than models that ran to 190. Check output tokens per request before compa
 Requests are greedy (temperature 0) by default, so runs repeat; `--temperature` and `--top-p` measure what
 sampling costs an engine, since most real traffic samples.
 
+Every level above is closed loop: a fixed number of requests in flight, each starting when the last one
+ends. Real traffic arrives at a rate whether or not the server keeps up. `--rate 2,4,8` makes each level an
+arrival rate in requests per second: requests start at random (Poisson) times at that rate for `--seconds`,
+however many are open. The largest `--concurrency` caps the requests in flight, split across processes like
+the rate; an arrival that finds its process at the cap is not sent and counts as dropped. Every request that
+arrived is counted, also one that finishes after the window, and req/s is completions over the time to the
+last one. It reads a little under the offered rate when the server keeps up (by about the slowest request
+over `--seconds`); well under, or latency rising from level to level, means it does not. Set `--concurrency`
+well above rate times p99 so that drops mean the server fell behind, not that the cap was too low. The row
+and the `--json` line add `rate` and `dropped`; `concurrency` is then the cap. This mode is new and has no
+measurements in this document yet.
+
 ---
 
 ## Sizing a fleet, and when to autoscale

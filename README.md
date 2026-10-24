@@ -886,7 +886,8 @@ scripts/
   test_endpoint.py        smoke-test a deployed endpoint
   benchmark.py            concurrency sweep: req/s, tok/s, p50/p95/p99 per level; --stream for time to
                           first token and goodput, --turns for multi-turn conversations, --schema for
-                          structured output, --reasoning-effort for reasoning models
+                          structured output, --reasoning-effort for reasoning models, --rate for
+                          requests arriving at a rate instead of a fixed number in flight
   quality.py              score the served model on the standard suite through the endpoint (lm-eval)
   extraction.py           entity extraction into a JSON object, asked three ways (schema, json_object, free)
   size_fleet.py           one engine's measured capacity -> instances and price per million tokens
