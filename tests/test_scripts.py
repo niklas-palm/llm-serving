@@ -121,6 +121,31 @@ def test_ignore_eos_asks_for_the_full_output_length(monkeypatch):
         assert seen and set(seen) == ({True} if flag else {None})
 
 
+def test_temperature_reaches_the_request_body(monkeypatch):
+    """Every measurement so far was greedy; --temperature and --top-p must reach the body to measure sampling."""
+    import multiprocessing as mp
+    bench = _load("benchmark")
+    seen = []
+
+    class Resp:
+        status_code = 200
+        def json(self): return {"usage": {"input_tokens": 1, "output_tokens": 1}}
+
+    class Session:
+        def __init__(self): self.headers = {}
+        def post(self, url, json, timeout):
+            seen.append((json["temperature"], json["top_p"])); return Resp()
+
+    monkeypatch.setattr(bench.requests, "Session", Session)
+    monkeypatch.setattr("signal.signal", lambda *a: None)
+    for t, p in ((0.0, 1.0), (0.7, 0.9)):
+        seen.clear(); q = mp.Queue()
+        bench.worker("http://u", "k", "m", conc=1, in_tok=[10], out_tok=[5], seconds=0.05, shared=True, q=q,
+                     temperature=t, top_p=p)
+        q.get(timeout=5)
+        assert seen and set(seen) == {(t, p)}
+
+
 def test_chat_mode_posts_chat_completions_and_reads_its_usage(monkeypatch):
     """A disaggregated-serving proxy routes only /v1/chat/completions: every /v1/responses request failed (Trainium N2).
     --chat must post there, with messages, and count prompt/completion tokens from its usage."""
