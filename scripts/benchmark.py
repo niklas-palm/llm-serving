@@ -25,6 +25,8 @@ model's effort. A comma-separated --input-tokens or --output-tokens is a mix, ea
 --ignore-eos makes every request generate exactly its output tokens (vLLM's ignore_eos), so engines and models
 are compared on the same work; without it a model that answers in 15 tokens looks many times faster.
 --temperature and --top-p set sampling (default greedy, temperature 0), to measure what sampling costs an engine.
+--rate 2,4,8 makes each level an arrival rate instead of a concurrency: requests start at random (Poisson) times at
+that rate however many are in flight, at most the largest --concurrency at once; one that would exceed it is dropped.
 
 Three things the script does that the numbers depend on, each with its measurement in docs/tuning.md
 (*If you are benchmarking this yourself* and *Two things about measuring itself*): prompts are unique by default, a nonce up front defeating the
@@ -196,16 +198,28 @@ def ask_chat(sess, url: str, model: str, text: str, max_out: int, stream: bool,
     return dt, ttft, int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0), "".join(parts)
 
 
+def arrivals(rate: float, seconds: float, rng: random.Random) -> list[float]:
+    """Start times in [0, seconds) of requests arriving at random at `rate` per second: exponential gaps,
+    which is how independent clients arrive."""
+    times, t = [], rng.expovariate(rate)
+    while t < seconds:
+        times.append(t)
+        t += rng.expovariate(rate)
+    return times
+
+
 def worker(url: str, key: str, model: str, conc: int, in_tok: list[int], out_tok: list[int],
            seconds: float, shared: bool, q: mp.Queue, stream: bool = False, turns: int = 1,
            budget: float = 0.0, schema: bool = False, effort: str = "", images: int = 0, image_px: int = 1024,
            same_image: bool = False, ignore_eos: bool = False, chat: bool = False, temperature: float = 0.0,
-           top_p: float = 1.0) -> None:
+           top_p: float = 1.0, rate: float = 0.0) -> None:
+    """Closed loop: `conc` threads, each starting its next conversation when the last one ends. With `rate`,
+    open loop: conversations start at Poisson arrival times, at most `conc` in flight."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)   # the parent handles Ctrl-C and terminates us
 
     stop = threading.Event()
     lock = threading.Lock()
-    stats = {"ok": 0, "fail": 0, "in": 0, "out": 0, "lat": [], "ttft": [], "decode": [], "in_budget": 0}
+    stats = {"ok": 0, "fail": 0, "in": 0, "out": 0, "lat": [], "ttft": [], "decode": [], "in_budget": 0, "dropped": 0}
     fixed = [image(image_px, same=True)] * images if images and same_image else []
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
 
@@ -225,64 +239,96 @@ def worker(url: str, key: str, model: str, conc: int, in_tok: list[int], out_tok
             if budget and dt <= budget:
                 stats["in_budget"] += 1
 
+    def conversation(count_late: bool) -> bool:
+        """One conversation of `turns` requests. False after a failure."""
+        # A session per conversation: its own cookie jar, so a sticky load balancer keeps the
+        # conversation on one engine, and a fresh connection so it is balanced like a new client.
+        sess = requests.Session()
+        sess.headers.update(headers)
+        text = ""
+        for _ in range(turns):
+            if stop.is_set() and not count_late:
+                break
+            try:
+                text = text or prompt(random.choice(in_tok), shared)
+                if images:
+                    dt, ttft, used_in, used_out, answer = ask_images(
+                        sess, url, model, text, random.choice(out_tok),
+                        fixed or [image(image_px) for _ in range(images)], ignore_eos, temperature, top_p)
+                elif chat:
+                    dt, ttft, used_in, used_out, answer = ask_chat(sess, url, model, text, random.choice(out_tok),
+                                                                   stream, ignore_eos, temperature, top_p)
+                else:
+                    dt, ttft, used_in, used_out, answer = ask(sess, url, model, text, random.choice(out_tok),
+                                                              stream, schema, effort, ignore_eos, temperature, top_p)
+            except (requests.RequestException, ValueError, AttributeError, TypeError, KeyError):
+                # A body that is not the promised shape is a failure too. Left uncaught, it killed
+                # the thread silently and the row reported a plausible number at lower concurrency.
+                with lock:
+                    stats["fail"] += 1
+                return False
+            if stop.is_set() and not count_late:
+                break             # finished after the window: drained, not counted
+            record(dt, ttft, used_in, used_out)
+            text = f"{text} {answer}{FOLLOW_UP}"
+        return True
+
     def one() -> None:
         while not stop.is_set():
-            # A session per conversation: its own cookie jar, so a sticky load balancer keeps the
-            # conversation on one engine, and a fresh connection so it is balanced like a new client.
-            sess = requests.Session()
-            sess.headers.update(headers)
-            text = ""
-            for _ in range(turns):
-                if stop.is_set():
-                    break
-                try:
-                    text = text or prompt(random.choice(in_tok), shared)
-                    if images:
-                        dt, ttft, used_in, used_out, answer = ask_images(
-                            sess, url, model, text, random.choice(out_tok),
-                            fixed or [image(image_px) for _ in range(images)], ignore_eos, temperature, top_p)
-                    elif chat:
-                        dt, ttft, used_in, used_out, answer = ask_chat(sess, url, model, text, random.choice(out_tok),
-                                                                       stream, ignore_eos, temperature, top_p)
-                    else:
-                        dt, ttft, used_in, used_out, answer = ask(sess, url, model, text, random.choice(out_tok),
-                                                                  stream, schema, effort, ignore_eos, temperature, top_p)
-                except (requests.RequestException, ValueError, AttributeError, TypeError, KeyError):
-                    # A body that is not the promised shape is a failure too. Left uncaught, it killed
-                    # the thread silently and the row reported a plausible number at lower concurrency.
-                    with lock:
-                        stats["fail"] += 1
-                    # An endpoint that fails instantly (503 while targets are unhealthy, refused
-                    # connections) would otherwise be hit thousands of times a second per thread.
-                    time.sleep(0.5)
-                    break
-                if stop.is_set():
-                    break             # finished after the window: drained, not counted
-                record(dt, ttft, used_in, used_out)
-                text = f"{text} {answer}{FOLLOW_UP}"
+            if not conversation(count_late=False):
+                # An endpoint that fails instantly (503 while targets are unhealthy, refused
+                # connections) would otherwise be hit thousands of times a second per thread.
+                time.sleep(0.5)
 
-    threads = [threading.Thread(target=one, daemon=True) for _ in range(conc)]
+    slots = threading.BoundedSemaphore(conc)
+
+    def arrival() -> None:
+        try:
+            # Every arrival is counted, also when it finishes after the window. Dropping the late ones
+            # would drop the slow ones, and hide a server that falls behind.
+            conversation(count_late=True)
+        finally:
+            slots.release()
+
     t_start = time.perf_counter()
-    for t in threads:
-        t.start()
-    time.sleep(seconds)
+    if rate:
+        threads = []
+        for t in arrivals(rate, seconds, random.Random()):
+            time.sleep(max(0.0, t_start + t - time.perf_counter()))
+            if not slots.acquire(blocking=False):
+                with lock:
+                    stats["dropped"] += 1
+                continue
+            threads.append(threading.Thread(target=arrival, daemon=True))
+            threads[-1].start()
+        time.sleep(max(0.0, t_start + seconds - time.perf_counter()))
+    else:
+        threads = [threading.Thread(target=one, daemon=True) for _ in range(conc)]
+        for t in threads:
+            t.start()
+        time.sleep(seconds)
     stop.set()
     wall = time.perf_counter() - t_start
     for t in threads:   # drain: every request opened inside the window finishes before we report
         t.join(timeout=330)
+    if rate:
+        wall = time.perf_counter() - t_start   # to the last completion, since the late ones are counted too
     with lock:   # copies, because a thread still inside its 330 s join could append while this pickles
         q.put({"wall": wall, **stats, "lat": list(stats["lat"]), "ttft": list(stats["ttft"]),
                "decode": list(stats["decode"])})
 
 
-def run_level(a: argparse.Namespace, model: str, total: int) -> dict:
+def run_level(a: argparse.Namespace, model: str, level: float) -> dict:
+    """One level: `level` requests in flight, or with --rate, `level` arrivals per second."""
+    total = a.max_in_flight if a.rate else level
     procs_n = min(a.processes, total)
     per_proc = [total // procs_n + (1 if i < total % procs_n else 0) for i in range(procs_n)]
     q: mp.Queue = mp.Queue()
     procs = [mp.Process(target=worker, args=(a.url, a.key, model, n, a.input_tokens, a.output_tokens,
                                              a.seconds, a.shared_prefix, q, a.stream, a.turns,
                                              a.budget_seconds, a.schema, a.reasoning_effort, a.images, a.image_px,
-                                             a.same_image, a.ignore_eos, a.chat, a.temperature, a.top_p)) for n in per_proc]
+                                             a.same_image, a.ignore_eos, a.chat, a.temperature, a.top_p,
+                                             level / procs_n if a.rate else 0.0)) for n in per_proc]
     for p in procs:
         p.start()
     # A worker killed by the OS (OOM) would leave a bare q.get() waiting forever; the level, the drain
@@ -308,7 +354,7 @@ def run_level(a: argparse.Namespace, model: str, total: int) -> dict:
     ttft = sorted(x for r in results for x in r["ttft"])
     decode = [x for r in results for x in r["decode"]]
     pct = lambda xs, p: xs[min(int(len(xs) * p), len(xs) - 1)] if xs else 0.0  # noqa: E731
-    return {
+    row = {
         "concurrency": total, "rps": ok / wall, "input_tok_s": sum(r["in"] for r in results) / wall,
         "output_tok_s": sum(r["out"] for r in results) / wall,
         "p50": statistics.median(lat) if lat else 0.0, "p95": pct(lat, 0.95), "p99": pct(lat, 0.99),
@@ -318,6 +364,9 @@ def run_level(a: argparse.Namespace, model: str, total: int) -> dict:
         "decode_tok_s_per_request": statistics.mean(decode) if decode else 0.0,
         "output_tokens_per_request": sum(r["out"] for r in results) / ok if ok else 0.0,
     }
+    if a.rate:
+        row.update(rate=level, dropped=sum(r["dropped"] for r in results))
+    return row
 
 
 def served_model(url: str, key: str) -> str:
@@ -340,6 +389,9 @@ def main() -> int:
     ap.add_argument("--key", required=True, help="the ApiKeyValue stack output")
     ap.add_argument("--concurrency", default="64,128,256",
                     help="comma-separated levels to sweep; keep going until throughput stops rising")
+    ap.add_argument("--rate", default="",
+                    help="comma-separated arrival rates (req/s) to sweep instead, Poisson arrivals; "
+                         "the largest --concurrency caps requests in flight")
     ap.add_argument("--input-tokens", default="1000", help="one size, or a comma-separated mix")
     ap.add_argument("--output-tokens", default="190", help="one size, or a comma-separated mix")
     ap.add_argument("--seconds", type=float, default=90, help="per level, after warm-up")
@@ -383,6 +435,14 @@ def main() -> int:
         return values
 
     levels = sizes("--concurrency", a.concurrency)
+    a.max_in_flight = max(levels)
+    if a.rate:
+        try:
+            levels = [float(x) for x in a.rate.split(",") if x.strip()]
+        except ValueError:
+            sys.exit(f"--rate must be comma-separated numbers (got {a.rate!r})")
+        if not levels or min(levels) <= 0:
+            sys.exit(f"--rate needs one or more rates above 0 (got {a.rate!r})")
     a.input_tokens = sizes("--input-tokens", a.input_tokens)
     a.output_tokens = sizes("--output-tokens", a.output_tokens)
     if a.temperature < 0 or not 0 < a.top_p <= 1:
@@ -402,7 +462,8 @@ def main() -> int:
           f"{f', {a.images} image(s) of {a.image_px} px per request' if a.images else ''}"
           f"{' (the same each time)' if a.same_image and a.images else ''}"
           f"{f', temperature {a.temperature:g}, top_p {a.top_p:g}' if a.temperature else ''}, {a.seconds:g}s per level "
-          f"after {a.warmup_seconds:g}s warm-up, {a.processes} client processes\n")
+          f"after {a.warmup_seconds:g}s warm-up, {a.processes} client processes"
+          f"{f', Poisson arrivals, at most {a.max_in_flight} in flight' if a.rate else ''}\n")
 
     # Warm-up: the first requests pay for CUDA graph capture and kernel autotuning. Measuring from the
     # instant a target reports healthy read 21% low here.
@@ -412,19 +473,21 @@ def main() -> int:
     a.seconds = saved
 
     extra = (f" {'ttft p50':>9} {'ttft p95':>9}" if a.stream else "") + (f" {'goodput':>8}" if a.budget_seconds else "")
-    print(f"{'conc':>6} {'req/s':>7} {'in tok/s':>9} {'out tok/s':>10} {'p50':>7} {'p95':>7} "
+    extra = (f" {'dropped':>7}" if a.rate else "") + extra
+    print(f"{'rate' if a.rate else 'conc':>6} {'req/s':>7} {'in tok/s':>9} {'out tok/s':>10} {'p50':>7} {'p95':>7} "
           f"{'p99':>7} {'tok/s/req':>10} {'failed':>7}{extra}")
     prev = None
     for level in levels:
         r = run_level(a, model, level)
-        extra = ((f" {r['ttft_p50']:>8.2f}s {r['ttft_p95']:>8.2f}s" if a.stream else "")
+        extra = ((f" {r['dropped']:>7}" if a.rate else "")
+                 + (f" {r['ttft_p50']:>8.2f}s {r['ttft_p95']:>8.2f}s" if a.stream else "")
                  + (f" {r['goodput_rps']:>8.1f}" if a.budget_seconds else ""))
-        print(f"{level:>6} {r['rps']:>7.1f} {r['input_tok_s']:>9,.0f} {r['output_tok_s']:>10,.0f} "
+        print(f"{level:>6{'g' if a.rate else ''}} {r['rps']:>7.1f} {r['input_tok_s']:>9,.0f} {r['output_tok_s']:>10,.0f} "
               f"{r['p50']:>6.2f}s {r['p95']:>6.2f}s {r['p99']:>6.2f}s "
               f"{r['decode_tok_s_per_request']:>10.1f} {r['failed']:>7}{extra}")
         if a.json:
             print(json.dumps({k: round(v, 3) if isinstance(v, float) else v for k, v in r.items()}))
-        if prev and r["input_tok_s"] < 0.85 * prev["input_tok_s"]:
+        if prev and not a.rate and r["input_tok_s"] < 0.85 * prev["input_tok_s"]:
             print("        throughput fell by more than 15% with more concurrency. A saturated server "
                   "plateaus; a fall usually means the client is the bottleneck. Add --processes.",
                   file=sys.stderr)
