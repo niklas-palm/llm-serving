@@ -253,6 +253,35 @@ def test_streaming_measures_time_to_first_token_and_reads_usage_from_the_complet
     assert len(r["ttft"]) == r["ok"] and all(t > 0 for t in r["ttft"])
 
 
+def test_a_stream_that_reaches_max_output_tokens_ends_incomplete_and_still_counts(monkeypatch):
+    """A vLLM nightly (2026-10-25) ends a stream that reaches max_output_tokens with response.incomplete instead of
+    response.completed; the benchmark counted every streamed request on it as failed."""
+    import multiprocessing as mp
+    import json as js
+    bench = _load("benchmark")
+
+    class Resp:
+        status_code = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def iter_lines(self):
+            yield b"data: " + js.dumps({"type": "response.output_text.delta", "delta": "1, 2, 3"}).encode()
+            yield b"data: " + js.dumps({"type": "response.incomplete",
+                                        "response": {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"},
+                                                     "usage": {"input_tokens": 12, "output_tokens": 5}}}).encode()
+
+    class Session:
+        def __init__(self): self.headers = {}
+        def post(self, url, json, timeout, stream): return Resp()
+
+    monkeypatch.setattr(bench.requests, "Session", Session)
+    monkeypatch.setattr("signal.signal", lambda *a: None)
+    q = mp.Queue()
+    bench.worker("http://u", "k", "m", conc=1, in_tok=[10], out_tok=[5], seconds=0.05, shared=True, q=q, stream=True)
+    r = q.get(timeout=5)
+    assert r["ok"] >= 1 and r["fail"] == 0 and r["out"] == 5 * r["ok"]
+
+
 def test_schema_and_reasoning_effort_land_in_the_request_body(monkeypatch):
     import multiprocessing as mp
     bench = _load("benchmark")
