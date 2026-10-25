@@ -151,11 +151,13 @@ def ask(sess, url: str, model: str, text: str, max_out: int, stream: bool, schem
                 ttft = time.perf_counter() - t0
             if kind == "response.output_text.delta":
                 parts.append(ev.get("delta", ""))
-            elif kind == "response.completed":
+            # A response that reaches max_output_tokens ends with response.incomplete (vLLM nightly 2026-10-25;
+            # earlier releases sent response.completed), with the same usage. --ignore-eos always ends that way.
+            elif kind in ("response.completed", "response.incomplete"):
                 usage = (ev.get("response") or {}).get("usage") or {}
     dt = time.perf_counter() - t0
     if not usage:
-        raise ValueError("stream ended without response.completed")
+        raise ValueError("stream ended without response.completed or response.incomplete")
     return dt, ttft, int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0), "".join(parts)
 
 
