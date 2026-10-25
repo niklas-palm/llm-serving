@@ -16,7 +16,10 @@ All rows are vLLM 0.28.0 in this project's container except where `engine_versio
 reads 0.30.0. Those last are large models on one 8 x B200 host (`p6-b200.48xlarge`) and one 8 x H100 host
 (`p5.48xlarge`), both through Capacity Blocks in us-west-2. They include image-input rows on Qwen3.8-Flash-Next,
 sent the way `scripts/benchmark.py --images` sends them: their `prompt_tokens` is the text only and `flags`
-names the images. All are measured through the CloudFront endpoint
+names the images. Rows dated 2026-10-24 and 2026-10-25 come from one 8 x B200 host on spot in ap-south-1,
+eight engines at TP=1 unless `topology` says otherwise, on the version `engine_version` names (0.29.0, 0.30.0
+or 0.32.0), every run with `--ignore-eos`; the quality rows of that date ran at 0.75 utilisation with the
+model's full context, and the `notes` column says when a drafter was on. All are measured through the CloudFront endpoint
 from an in-region client with `scripts/benchmark.py` (60 to 120 s per level after warm-up) and
 `scripts/quality.py` (lm-evaluation-harness 0.4.13; the quality rows dated 2026-09-10 are the standard
 suite, evaluation deployments at 0.80 utilisation with a 2,048-token prefill chunk, thinking off; the Gemma 4 rows

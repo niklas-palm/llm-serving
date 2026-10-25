@@ -723,6 +723,45 @@ For the larger GLM-5.3, fp8 (756 GB) needs all eight GPUs and NVFP4 (464 GB) fit
 2 × TP=4 against fp8 at 1 × TP=8 measured 41.6 against 21.0 rps at 512 in flight, most of it the second
 engine. The quality of these NVFP4 builds was not measured.
 
+#### On B200s, check the fp8 kernel: two fp8 builds ran slower than bf16
+
+Eight B200s, one engine per GPU, 1k prompts and 190 tokens out, vLLM 0.29.0; 0.30.0, 0.31.0 and 0.32.0
+measured the same.
+
+**A per-tensor fp8 checkpoint needs the CUTLASS kernel.** For NVIDIA's ModelOpt fp8 builds vLLM picks
+`FlashInferFP8ScaledMMLinearKernel`. On this GPU it spends about 350 µs of host CPU on each fp8 matmul
+before the GPU kernel runs. Inside a CUDA graph (steps up to 512 tokens) that cost is not paid, so decode
+is fast. A step with a longer prefill runs outside the graphs and pays it 128 times (32 layers × 4
+matmuls), and the GPU waits. Llama 3.1 8B:
+
+| Weights and kernel | One 1k prefill | One 4k prefill | 32 in flight per engine | 64 in flight per engine |
+|---|---|---|---|---|
+| bf16 | 30 ms | 64 ms | 216.4 rps | 299.9 rps |
+| fp8, the kernel vLLM picks | 70 ms | 68 ms | 137.1 rps | 166.8 rps |
+| fp8, `VLLM_DISABLED_KERNELS=FlashInferFP8ScaledMMLinearKernel` | 26 ms | 51 ms | 299.9 rps | 432.6 rps |
+
+A profile of one 1,008-token prefill step: 67.2 ms with the default kernel, 8.0 ms of it GPU work;
+17.4 ms with CUTLASS, 8.3 ms GPU work. The CPU time inside the fp8 matmul op was 44.9 ms against 3.1 ms.
+Set it in `extraEnv`: `{VLLM_DISABLED_KERNELS: FlashInferFP8ScaledMMLinearKernel}`. The startup log then
+names `CutlassFP8ScaledMMLinearKernel`. On the RTX PRO 6000 the same checkpoint and default kernel were
+1.7 to 1.8× bf16.
+
+**Serve Qwen3.8 in bf16 on B200, not its fp8 build.** vLLM turns DeepGEMM off for the Qwen3.5 model
+family on Blackwell (`Auto-disabled DeepGemm for model_type=qwen3_5_text on Blackwell` in the log, for
+accuracy) and falls back to a CUTLASS block-fp8 kernel that is slow here under load. Qwen3.8-27B-FP8
+against bf16 on the same engines:
+
+| | One request, decode | 1k prompts, 32 per engine | 1k prompts, 64 per engine | 4k prompts, 64 per engine |
+|---|---|---|---|---|
+| bf16 | 93 tok/s | 60.0 rps | 83.5 rps | 31.2 rps |
+| fp8 | 109 tok/s | 38.3 rps (0.64×) | 39.6 rps (0.47×) | 6.1 rps (0.20×) |
+
+Disabling the CUTLASS kernel made it worse (vLLM then picks the weight-only Marlin kernel). On eight
+H100s, where the rule does not apply (it covers SM100 and SM120), the same fp8 checkpoint was 1.33 to 1.35×
+bf16 at 256 and 512 in flight (vLLM 0.28.0).
+Block fp8 with DeepGEMM is not slow on B200: LiquidAI's LFM2.5-24B-A2B-FP8 on vLLM 0.32.0 picked
+`DeepGemmFp8BlockScaledMMKernel` and ran at 1.01 to 1.11× bf16 on 1k and mixed prompts.
+
 #### 4-bit is two different products on this GPU: native FP4 compute, or weight-only dequantisation
 
 Measured on Gemma 4 with the same matrix on one engine, each 4-bit build against its own family's fp8:
@@ -1701,6 +1740,24 @@ Qwen3.8's ~940-token prompts held one block, and MTP gave it back. So on hybrid 
 prompts get nothing from the prefix cache, and a drafter costs one block per request; long prompts keep
 most of it. Read `vllm:prefix_cache_hits_total` before trusting a cached benchmark with a drafter on.
 
+**On vLLM 0.30.0 `disable_eagle_block_drop` keeps that block, and the drafter then pays on cached long
+prompts.** It goes in the speculative config:
+`{"method":"mtp","num_speculative_tokens":2,"disable_eagle_block_drop":true}`. Qwen3.8-27B (a dense
+hybrid) on eight B200s, one engine per GPU, every prompt cached, rps at 1 / 8 / 32 in flight per engine:
+
+| Cached prompt | No drafter | MTP, two draft tokens | MTP with `disable_eagle_block_drop` |
+|---|---|---|---|
+| 4k tokens, hits | 86.5% | 66.2% | 88.3% |
+| 4k tokens, rps | 3.51 / 25.3 / 71.7 | 7.26 / 39.8 / 75.9 | 7.54 / 49.0 / 118.7 |
+| 16k tokens, hits | 97.6% | 94.1% | 99.6% |
+| 16k tokens, rps | 3.46 / 24.3 / 68.1 | 6.64 / 39.7 / 80.9 | 7.06 / 45.7 / 118.3 |
+
+Time to first token at 32 per engine on 4k prompts: 139 ms without a drafter, 258 ms with MTP, 152 ms
+with the option. Quality with the option on, the standard suite through `quality.py`: GSM8K 97.4 against
+97.2 without a drafter, IFEval 79.7 against 80.2, MMLU 83.4 against 83.4, every task within one standard
+error. vllm#53912 reports corrupt output with prefix caching and MTP on hybrid models; it did not show
+here. Prompts shorter than one block still get no hits: the option only stops the give-back.
+
 So: turn on a shipped MTP head on a single-GPU engine, try two draft tokens, and measure it before
 trusting it on a tensor-parallel one. The "speculation loses at load" rule of the EAGLE-3 draft did
 not apply here: a 3B-active model leaves compute to spare for verification. Judge any speculation by request rate and per-request decode on your traffic, never
@@ -2454,6 +2511,7 @@ Conditions that change between sections are stated where they matter; the campai
 | KV cache offload to host memory (*Offloading the cache to host memory moves the capacity wall*) | one `g7e.4xlarge` (128 GiB host RAM) in eu-west-2 | 30B MoE fp8 | six-turn conversations of 8,000 tokens, streamed, 120 to 240 s per level, 32 to 224 conversations in flight; host tier 0 or 32 GiB; one run with the GPU cache pinned to 81,376 tokens |
 | The move to vLLM 0.29.0 (*What happens when a container is overloaded*) | one `g7e.2xlarge` in ap-south-1 | 30B MoE fp8, plain and with EAGLE-3, both engines on the same host; on 0.29.0 against earlier 0.28.0 rows: dense 32B fp8, 120B MXFP4 (also both engines), Gemma 4 26B NVFP4 and 12B W4A16; the 30B quality suite | the single-engine matrix, 8 to 64 in flight; overload at 64 to 512 with and without `--max-num-queued-reqs`; same kernels chosen on both engines, most rows within 5%, none beyond 11%, quality scores within one standard error |
 
+| fp8 kernels on B200 and MTP with `disable_eagle_block_drop` (*On B200s, check the fp8 kernel*, *Speculative decoding*), vLLM 0.29.0 to 0.32.0 | one `p6-b200.48xlarge` (8 × B200) spot in ap-south-1 | Llama 3.1 8B bf16 and fp8 (ModelOpt), Qwen3.8-27B bf16 and fp8, LFM2.5-24B-A2B | eight engines × TP=1, 64 to 512 in flight per host, 60 s per level, `--ignore-eos`; prefill timed one request at a time; one prefill step profiled with vLLM's torch profiler |
 | Large models on Capacity Blocks, vLLM 0.30.0 (*Topology*, *Speculative decoding*, *NVFP4*, *Image inputs*, *Engine tuning*) | one `p6-b200.48xlarge` (8 × B200), one `p5.48xlarge` (8 × H100) | DeepSeek-V4 Flash and Pro, GLM-5.3 and GLM-5.3-Flash, Kimi-K2.6, MiniMax-M2.7, Qwen3.8-Flash-Next, Qwen3-Coder-480B, Step-3.7-Flash; Qwen3-30B, Qwen3-235B and gpt-oss-120b repeated | same matrix, 64 to 512 per host; long prompts to 32k unique and cached; image inputs at 16 to 128 |
 
 Run-to-run noise, measured by repeating configurations: an eight-engine H100 host reproduced every row
