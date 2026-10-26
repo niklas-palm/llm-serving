@@ -2368,14 +2368,16 @@ looks like a working notification and is not one.
 
 ### Health-check grace for a slow first start
 
-`healthCheckGraceMinutes` (default 30) is how long ECS ignores a new task's failing health checks.
-After that, a task that is still loading counts as unhealthy, and ECS stops it and starts a
-replacement, which loads from the beginning. The load balancer's own health check is separate: it only
-decides whether a task gets traffic.
+`healthCheckGraceMinutes` (default 30) is how long ECS ignores a new task's failing health checks,
+counted from the moment the task starts. After that, a task that is still loading counts as unhealthy,
+and ECS stops it and starts a replacement, which loads from the beginning. The load balancer's own
+health check is separate: it only decides whether a task gets traffic.
 
-30 minutes was enough for every model measured here up to Beam-1.0-501B (503 GB in fp8, 22 minutes
-from deploy to healthy on eight B200s). DeepSeek-V4.1-Flash was not: on eight B200s, vLLM 0.32.0, its
-first start answered the first health check about 60 minutes after the task started. Most of that time
+Because the clock starts with the task, a deploy can take longer than the grace without a replacement:
+CloudFormation and the rollout come before it. The longest deploy to healthy measured here without a
+replacement was Kimi-K2.6 at 2 × TP=4 on eight B200s, 41 minutes, of which the weights alone were 22 to
+25 minutes per engine. DeepSeek-V4.1-Flash did not fit: on eight B200s, vLLM 0.32.0, its first start
+answered the first health check about 60 minutes after the task started. Most of that time
 was FlashInfer autotuning its kernels (`[AutoTuner]: Tuning mxfp8_gemm` in the log); loading the weights
 was a small part of it. At minute 30 ECS marked the task unhealthy and started a replacement. Here the
 replacement could not be placed (`TaskFailedToStart: RESOURCE:GPU`, because the first task still held
