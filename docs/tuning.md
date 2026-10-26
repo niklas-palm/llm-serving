@@ -1558,6 +1558,21 @@ PCIe, and in bf16 a result that depends on the degree. Measure it: one flag, one
 One case where it is not optional: a block-quantised FP8 checkpoint at a tensor-parallel degree that
 does not divide its expert size into whole tiles refuses to start without it (see *Tensor parallelism*).
 
+**Do not force the MoE kernel when you switch it.** vLLM picks the expert kernel per layout, and each
+kernel is fast on one layout only. MiniMax-M2.7 (publisher fp8) on one `p5.48xlarge`, two engines at
+TP=4, vLLM 0.30.0, 1k prompts, rps at 512 in flight, with `--moe-backend` forced (c17h-mm-*):
+
+| Layout | Triton fp8 MoE | FlashInfer CUTLASS fp8 MoE |
+|---|---|---|
+| TP=4 | **42.4** (the default pick) | 31.9 (−25%) |
+| TP=4 + expert parallelism | 34.0 (−20%) | **42.5** (the default pick) |
+
+With the defaults, expert parallelism measured neutral here (42.4 against 42.5) because each layout got
+its own kernel. A forced kernel carried across the switch costs 20 to 25%, and it looks like an expert
+parallelism loss. The startup log names the kernel (`Using TRITON Fp8 MoE backend`); check it before
+reading an expert parallelism comparison. The same TP=4 default run on another `p5` a month earlier gave
+42.5, so these numbers hold across hosts.
+
 ---
 
 ## Settings that sound useful and measurably are not
@@ -2539,6 +2554,7 @@ Conditions that change between sections are stated where they matter; the campai
 | The move to vLLM 0.29.0 (*What happens when a container is overloaded*) | one `g7e.2xlarge` in ap-south-1 | 30B MoE fp8, plain and with EAGLE-3, both engines on the same host; on 0.29.0 against earlier 0.28.0 rows: dense 32B fp8, 120B MXFP4 (also both engines), Gemma 4 26B NVFP4 and 12B W4A16; the 30B quality suite | the single-engine matrix, 8 to 64 in flight; overload at 64 to 512 with and without `--max-num-queued-reqs`; same kernels chosen on both engines, most rows within 5%, none beyond 11%, quality scores within one standard error |
 | fp8 kernels on B200 and MTP with `disable_eagle_block_drop` (*On B200s, check the fp8 kernel*, *Speculative decoding*), vLLM 0.29.0 to 0.32.0 | one `p6-b200.48xlarge` (8 × B200) spot in ap-south-1 | Llama 3.1 8B bf16 and fp8 (ModelOpt), Qwen3.8-27B bf16 and fp8, LFM2.5-24B-A2B | eight engines × TP=1, 64 to 512 in flight per host, 60 s per level, `--ignore-eos`; prefill timed one request at a time; one prefill step profiled with vLLM's torch profiler |
 | Large models on Capacity Blocks, vLLM 0.30.0 (*Topology*, *Speculative decoding*, *NVFP4*, *Image inputs*, *Engine tuning*) | one `p6-b200.48xlarge` (8 × B200), one `p5.48xlarge` (8 × H100) | DeepSeek-V4 Flash and Pro, GLM-5.3 and GLM-5.3-Flash, Kimi-K2.6, MiniMax-M2.7, Qwen3.8-Flash-Next, Qwen3-Coder-480B, Step-3.7-Flash; Qwen3-30B, Qwen3-235B and gpt-oss-120b repeated | same matrix, 64 to 512 per host; long prompts to 32k unique and cached; image inputs at 16 to 128 |
+| The MoE kernel per layout (*`enableExpertParallel: false`*), vLLM 0.30.0 | one `p5.48xlarge` (8 × H100) spot in ap-northeast-1 | MiniMax-M2.7 fp8 | two engines × TP=4, with and without expert parallelism, `--moe-backend` forced to each kernel, 64 to 512 in flight per host |
 
 Run-to-run noise, measured by repeating configurations: an eight-engine H100 host reproduced every row
 within ±2% back to back and across two days and two regions, and the same configuration on another
