@@ -113,7 +113,8 @@ prefill-bound past it.
 ## Choosing an instance type
 
 The catalog also knows `p5.4xlarge` and `p5.48xlarge` (H100 SXM, 80 GiB HBM3 at 3,350 GB/s, 1 and 8
-GPUs) so the same stack can be measured on Hopper; every figure in this document is g7e unless a table
+GPUs) so the same stack can be measured on Hopper, and `p6-b200.48xlarge` (8 × B200, 179 GiB) for the
+largest models; every figure in this document is g7e unless a table
 says otherwise, and NVFP4 checkpoints do not run on an H100. Measured on eight of each with the same
 matrix (*Choosing a model to host*, point 10): the H100 is +26% on the fp8 mixture-of-experts and +124%
 on a dense bf16 model, at roughly 1.8× the spot price per GPU-hour. On Gemma 4 the gap followed the
@@ -319,7 +320,8 @@ the constraint. bf16 weights have no tiles and no such limit.
 
 **If you raise the degree outside this project's config, raise `/dev/shm` too.** Workers exchange
 tensors through POSIX shared memory; with Docker's 64 MiB default any degree above 1 exits within
-seconds with `Insufficient space in /dev/shm`. The task definition here sets 8 GiB. TP=1 never touches
+seconds with `Insufficient space in /dev/shm`. The task definition here sets half the container's
+memory, at least 8 GiB. TP=1 never touches
 that path, so a working single-GPU deployment proves nothing about a multi-GPU one.
 
 ---
@@ -378,7 +380,7 @@ Precision is two choices, set by different keys:
 
 | Decision | Key | Default here | What it affects |
 |---|---|---|---|
-| **Weight** precision | `modelId` / `quantization` | whatever the model ships | the model's own parameters |
+| **Weight** precision | `modelId` / `quantization` | `fp8`, quantised at load time | the model's own parameters |
 | **KV cache** precision | `tuning.kvCacheDtype` | `fp8` | cached attention state, not the weights |
 
 Either can be taken without the other: quantised weights change the model you run, a quantised KV
@@ -454,7 +456,7 @@ served configuration on one 96 GB GPU; deltas are against the family's bf16 row.
 | publisher fp8, fp8 KV | +0.1 | 0.0 | +0.2 | −0.6 | +0.3 | −0.6 | −0.9 | +0.4% | 2 to 4% |
 | community NVFP4 | −1.1 | +0.6 | +1.6 | +1.4 | −0.6 | 0.0 | +0.4 | +1.9% | 4 to 6% |
 
-**Gemma 4 26B-A4B (mixture of experts, 3.8B active; a sixth family, scored with chat-templated multiple choice, no perplexity), bf16 = MMLU 84.2, ARC 70.8, HellaSwag 62.4, Winogrande 70.2, TruthfulQA 62.9, GSM8K 93.8, IFEval 87.1**
+**Gemma 4 26B-A4B (mixture of experts, 3.8B active; a fourth family, scored with chat-templated multiple choice, no perplexity), bf16 = MMLU 84.2, ARC 70.8, HellaSwag 62.4, Winogrande 70.2, TruthfulQA 62.9, GSM8K 93.8, IFEval 87.1**
 
 | Served as | MMLU | ARC | HellaSwag | Winogrande | TruthfulQA | GSM8K | IFEval | Answers flipped |
 |---|---|---|---|---|---|---|---|---|
@@ -491,7 +493,7 @@ against fp8 on the log-likelihood tasks: ARC 71.4 against 72.2, HellaSwag 75.8 a
 77.0 against 79.0, TruthfulQA 59.3 against 61.5, a 1 to 2 point cost, the same as every other 4-bit
 build. Its generative passes were lost to an engine disconnect and were not repeated.
 
-What generalises across the five families:
+What generalises across the four families:
 
 - **fp8 weights cost nothing measurable.** Every task within one standard error of bf16 on every model,
   perplexity 0.2 to 0.7% worse, 2 to 4% of answers flipped with gains about equal to losses. Load-time
@@ -794,10 +796,10 @@ A 4-bit AWQ build measured the best throughput on both prompt conditions: **82,1
 **33,496** unique, against 74,687 and 32,467 for FP8. About 15 GiB of weights instead of 29 leaves more
 of the card for KV cache, and cache space caps concurrency.
 
-**This is not a recommendation.** Everything measured here is throughput; **output quality was never
-evaluated.** That matters most at 4 bits: it is a far larger perturbation than FP8, a sparse
-mixture-of-experts has less redundancy per expert to absorb the error than a dense model of the same
-size, and community 4-bit uploads vary in calibration quality.
+**This is not a recommendation.** Everything measured here is throughput; **the output quality of this
+build was not scored.** AWQ builds of other models cost 0.5 to 2 points on the standard suite and about a
+point of BFCL (*What quantisation costs in answers*, *What quantisation costs an agent*), and community
+4-bit uploads vary in calibration quality.
 
 Validate it against your own evaluations, as you would any model change. Do not adopt it on a
 throughput number alone.
@@ -1308,7 +1310,7 @@ memory profiling and fails under real load. 0.95 → 0.97
 measured **+1.6%**; at 0.97 the mixture-of-experts model above was stable, while a dense 27B on the
 same hardware crashed under load.
 
-**0.95 itself is not universally safe.** Two independent cases where it is too high:
+**0.95 itself is not universally safe.** Three cases where it is too high:
 
 1. **Dense models**, as the 27B above.
 2. **Unquantised weights with an fp8 KV cache.** Starts cleanly, passes its health check, then fails
@@ -1370,8 +1372,8 @@ On unique prompts the cost is within noise for both families; on a fully shared 
 serve about twice the requests. The cache saves the prefill, so the gain is the prefill's share of the
 work: 1k-token prompts with 190-token answers.
 
-**The caveat is about concurrency, not the flag.** Every throughput figure here was measured with
-prompts that share a prefix; *Choosing an operating concurrency* gives both numbers. Sizing a fleet from
+**The caveat is about traffic, not the flag.** Figures here say whether prompts were unique or shared a
+prefix; *Choosing an operating concurrency* gives both numbers. Sizing a fleet from
 the cached figure when your traffic has no shared prefix **under-provisions by about 2×**.
 
 #### Prefix caching is a routing decision
@@ -2457,12 +2459,10 @@ namespace `<stack>/Engine`, the bottom three rows of the dashboard. Nothing to e
 | `vllm:num_requests_running` | same widget | Sequences in the current batch. Pinned at `maxNumSeqs` means the batch ceiling is the limit; well below it while requests wait means KV cache is. |
 | `vllm:kv_cache_usage_perc` | *Is the KV cache filling up?* | 0 to 1. Near 1 is the real ceiling on concurrency, and what `gpuMemoryUtilization: 0.95` buys more of. |
 | `vllm:num_preemptions_total` | *Are engines redoing work?* | **Anything above zero is trouble.** The engine evicted a running sequence to free cache and will recompute it from scratch. Rising preemptions are the mechanism behind a collapsing p99. |
-
 | `vllm:time_to_first_token_seconds` | *How long does a request take inside the engine?* | Average time to first token: queue wait plus prefill. Rising while *waiting* is zero means prefill itself is the cost (long prompts). |
 | `vllm:e2e_request_latency_seconds` | same widget | Average whole-request time as the engine saw it. Compare with the load balancer's p50: a gap is the network path, not the engine. |
 | `vllm:request_prompt_tokens` | *What shape are the requests being served?* | Average input tokens per request. The number `scalingRequestsPerTarget` is derived from; if it drifts, so should the threshold. |
 | `vllm:request_generation_tokens` | same widget | Average output tokens per request. Pinned at a round number means callers hit their `max_output_tokens`. |
-
 | `vllm:prefix_cache_queries_total`, `vllm:prefix_cache_hits_total` | *Is the prefix cache paying off?* | Hit rate = hits / queries, in prompt tokens, per minute. A shared system prompt shows up here; unique prompts read 0%, which is what the fleet is sized for. |
 
 The four latency and size metrics are histograms in the engine, but the collector passes CloudWatch
@@ -2519,8 +2519,8 @@ How it is built:
 * To add a metric, append its name to `ENGINE_METRICS` and give it a widget. The endpoint exposes ~86
   families; the shortlist is short because **custom metrics are billed per name** (about $0.30 each
   per month) and the rest are derivable from these, duplicated by the load balancer, or histograms,
-  which CloudWatch receives as Min/Max/Sum/Count and cannot turn into a p95. Time-to-first-token
-  therefore stays on the load balancer's response time graph.
+  which CloudWatch receives as Min/Max/Sum/Count and cannot turn into a p95. The dashboard shows time
+  to first token as an average; percentiles stay on the load balancer's response time graph.
 
 Not collected: **GPU utilisation** needs a host-level agent and NVIDIA's DCGM exporter, and on a
 decode-heavy workload it reads near 100% while the memory bus is the limit. **Per-task engine
@@ -2579,7 +2579,7 @@ concurrency limit at the client.
 ## Where the numbers come from
 
 Every figure in this document was measured in the project's container, through the CloudFront endpoint,
-with `scripts/benchmark.py` on an in-region EC2 client, on vLLM 0.28.0 unless the row says 0.29.0 or 0.30.0.
+with `scripts/benchmark.py` on an in-region EC2 client, on vLLM 0.28.0 unless the row names another release.
 Conditions that change between sections are stated where they matter; the campaigns behind them:
 
 | Measurements | Hardware | Models | Shape of the run |
@@ -2607,8 +2607,8 @@ spot instance ten days later within +0 to +3% on every shape and level; a single
 (cached shapes ±4%), and two regions' single-engine baselines matched within 4%. The p95 of time to
 first token moves ±25% between identical runs. A difference inside those bands is not a result.
 A later engine release moves the kernel choices named in *The evidence* and *troubleshooting.md*, and
-with them every 4-bit figure and the KV precision result. Not re-measured on 0.29.0: multi-GPU topologies,
-the H100 rows, prompts above 4,000 tokens, the host-memory KV tier, Mistral, Nemotron, the 80B hybrid and
+with them every 4-bit figure and the KV precision result. Not re-measured on 0.29.0: the 0.28.0 multi-GPU
+topology and H100 comparison rows, prompts above 4,000 tokens, the host-memory KV tier, Mistral, Nemotron, the 80B hybrid and
 the agentic benchmarks. Every path that was re-measured kept its kernels, so these are expected to hold, but
 they are 0.28.0 numbers.
 

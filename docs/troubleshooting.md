@@ -378,7 +378,7 @@ aws autoscaling describe-scaling-activities --auto-scaling-group-name "$ASG" --r
   that offer the type, not live inventory, and pinning to it reduces the zones the ASG can try.
 
 **On `InsufficientInstanceCapacity` during a first deploy:** CloudFormation keeps waiting on the ECS
-service for up to an hour before it rolls back, and a stack in `CREATE_IN_PROGRESS` cannot be updated.
+service for up to three hours before it rolls back, and a stack in `CREATE_IN_PROGRESS` cannot be updated.
 Do not wait. `cdk destroy`, set `useSpot: true`, deploy again: about ten minutes to a working endpoint,
 measured here after on-demand had no `g7e.2xlarge` in either zone of `us-east-2`.
 
@@ -504,8 +504,8 @@ The task exits within seconds of starting. Only with `tensorParallel` above 1: o
 passes tensors through a POSIX shared-memory ring buffer in `/dev/shm`, and Docker's default 64 MiB is
 not enough. TP=1 does not use this path, so a working single-GPU deployment proves nothing.
 
-**Already fixed in this project:** the task definition sets 8 GiB unconditionally
-(`shared_memory_size` in `infra/serving_stack.py`). Do not make it conditional on the tensor-parallel
+**Already fixed in this project:** the task definition sets half the container's memory, at least 8
+GiB, unconditionally (`shared_memory_size` in `infra/serving_stack.py`). Do not make it conditional on the tensor-parallel
 degree: the degree can also be raised through `EXTRA_ARGS`, where the stack cannot see it.
 
 Check:

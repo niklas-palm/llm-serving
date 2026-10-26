@@ -169,7 +169,7 @@ Add `--instance-market-options MarketType=spot` to probe the spot pool instead; 
 an account may be able to get one and not the other.
 
 Deploy step 3 shows how to read the same answer from a running deploy within minutes rather than after
-CloudFormation's hour-long wait.
+CloudFormation's wait of up to three hours.
 
 ### Capacity Blocks
 
@@ -250,7 +250,8 @@ measured default. Sizes are the checkpoint's, GPUs are per engine:
 Served on eight H100s or eight B200s with vLLM 0.30.0 (set `FROM vllm/vllm-openai:v0.30.0` in
 `container/Dockerfile` and the matching `TAG` in `scripts/build_image.py`; the shipped 0.29.0 was not tried
 with these). Give all of them `extraEnv: {VLLM_ENGINE_READY_TIMEOUT_S: "1200"}` (troubleshooting, *never
-becomes ready*):
+becomes ready*), and raise `healthCheckGraceMinutes` for a first start longer than 30 minutes (*Health-check
+grace for a slow first start* in docs/tuning.md):
 
 | Model | Kind | GPUs | Formats served | Beyond `modelId` |
 |---|---|---|---|---|
@@ -515,7 +516,7 @@ loads the model.
 
 **Check the instance launched, a few minutes in.** This is the step that fails, and it fails quietly:
 the ASG reports the reason within seconds, but CloudFormation keeps waiting on the ECS service for up to
-an hour before it gives up.
+three hours before it gives up.
 
 ```bash
 REGION=eu-west-2        # the region in your config
@@ -550,8 +551,8 @@ engine, and how that plays out depends on whether the fleet has a spare GPU:
 
 | Fleet | What ECS does | Measured |
 |---|---|---|
-| Fixed (`maxInstanceCount` equal to `instanceCount`, the default shape) | No GPU is free, so it stops engines to make room: one first, the rest once that one is healthy. | 6 engines, same image: 5 healthy for 5 min, then 1 for 6 min, no full outage. 6 engines, new model: 0 healthy for 2 min, 503 for 5, back to full in 10. |
-| Headroom (`maxInstanceCount` above `instanceCount`, quota for one more instance) | The capacity provider adds an instance, new engines start there before old ones stop, one at a time. | Reported by a tester: ~24 min, no outage. Not measured here. |
+| Fixed (`maxInstanceCount` equal to `instanceCount`) | No GPU is free, so it stops engines to make room: one first, the rest once that one is healthy. | 6 engines, same image: 5 healthy for 5 min, then 1 for 6 min, no full outage. 6 engines, new model: 0 healthy for 2 min, 503 for 5, back to full in 10. |
+| Headroom (`maxInstanceCount` above `instanceCount`, as shipped, and quota for one more instance) | The capacity provider adds an instance, new engines start there before old ones stop, one at a time. | Reported by a tester: ~24 min, no outage. Not measured here. |
 
 Pick by what you can afford: a fixed fleet redeploys in about a reload time but drops the endpoint for
 part of it; headroom keeps the endpoint up and costs an extra instance until the ~15-minute managed
