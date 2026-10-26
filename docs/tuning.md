@@ -942,9 +942,31 @@ TP=4 measured +52 to +54% on 4k unique prompts at 256 to 512 in flight, and 0.85
 
 **So for an MLA model, try `dataParallel` with expert parallelism when prompts are long and unique or
 the cache is the limit; keep tensor parallelism for cached, low-concurrency or decode-bound traffic.**
-The capacity gain is the mechanism above. Why long unique prompts gain even where capacity does not bind
-is not established: it is not the duplicated cache reads under TP, because with the same prompts cached
-DP lost. So the gain is on the prefill side, and its mechanism is open.
+The capacity gain is the mechanism above. Where capacity does not bind, the difference is scheduling.
+DeepSeek-V4-Flash on one `p5.48xlarge`, two engines either way, vLLM 0.30.0, profiled with vLLM's torch
+profiler on rank 0 over 20 iterations (c17h-dsv4-*-prof*):
+
+| Rank 0, share of GPU kernel time | MoE matmuls | Communication |
+|---|---|---|
+| TP=4, unique 32k prompts | 50% | 8% (all-reduce) |
+| DP=4 + EP, unique 32k prompts | 38% | 48% (all-gather, reduce-scatter) |
+| TP=4, the same prompts cached | 49% | 12% |
+| DP=4 + EP, the same prompts cached | 57% | 13% |
+
+- **Unique long prompts:** DP=4 + EP spends far more on communication and still wins. Under TP=4 the
+  profiled steps are almost all ~8,000-token prefill chunks: one engine prefills one long prompt at a
+  time on four GPUs, and every decoding request waits. DP=4 + EP has four schedulers that each prefill
+  their own requests, and decode steps keep running between the chunks.
+- **It is not the larger token budget of four schedulers.** With `maxNumBatchedTokens` cut to a quarter
+  per rank (the same total as TP=4), DP=4 + EP still led TP=4 by 50% on 32k prompts at 64 in flight (0.87
+  against 0.58 rps; c17h-dsv4-dp4ep-mnbt2k against h30-dsv4-tp4 from the earlier campaign, whose DP=4 + EP
+  control this host reproduced within 2%).
+- **Cached prompts:** with decode on both sides, communication is the same share, so DP's loss there
+  is not communication. Its ranks spend more of their time in the expert matmuls. That fits each rank
+  running the experts on a quarter of the batch; per-rank batch sizes were not measured.
+
+So pick by which phase dominates: DP=4 + EP when unique long prompts make prefill the bulk of the work,
+TP=4 when cached prompts or long answers make it decode.
 
 #### When the model needs several GPUs: the smallest degree that fits, then replicas
 
@@ -2547,6 +2569,7 @@ Conditions that change between sections are stated where they matter; the campai
 | H100 comparison, multi-GPU topologies (TP, EP, DP) | one `p5.48xlarge` (8 × H100) | the same, plus a 235B MoE in fp8 and bf16 | same matrix, 64 to 512 per host |
 | Routing and the prefix cache, decode ceilings and the memory-controller measurement, KV precision by kernel, CUDA graph mode, warm restart, dynamic speculation, dense contrast, quality | 1 and 8 × `g7e.2xlarge` | 30B MoE fp8, 27B dense, 120B MXFP4 | streamed, 1 to 128 per engine, 60 to 120 s per level |
 | Repeatability across regions and days, long prompts to 64k, KV precision by context length, structured output, the 8B and 32B dense points, the 80B hybrid MoE on one GPU and at TP=2 with its MTP head, quality on two tasks for eleven configurations | one `g7e.2xlarge` in three regions, one `p5.48xlarge` | 30B MoE, 8B, 27B, 32B dense, 80B hybrid MoE, 120B MXFP4 | streamed, 90 s levels, 1 to 256 in flight; lm-eval gsm8k 500 and ifeval 541 |
+| Why DeepSeek's layouts win where they do (*The exception: MLA models*), vLLM 0.30.0 | one `p5.48xlarge` (8 × H100) spot in ap-northeast-1 | DeepSeek-V4-Flash | two engines as TP=4 or DP=4 + EP, 16k and 32k prompts unique and cached; one prefill budget cut; rank-0 torch profiles over 20 iterations |
 | Output quality of every precision against its own bf16 (*What quantisation costs in answers*) | one `g7e.2xlarge` or `g7e.8xlarge` in four regions | 30B MoE (two releases), 8B, 27B, 32B dense, Mistral Small 3.2 24B; bf16, fp8, NVFP4, GPTQ, AWQ, fp8 KV | lm-eval 0.4.13 standard suite: MMLU 2,850, five log-likelihood tasks at 500, WikiText 60 docs, GSM8K 500, IFEval 541; ~40 min per configuration |
 | Agentic quality of every precision (*What quantisation costs an agent*, *Tool calling*) | 4 × `g7e.2xlarge` in two regions, 2 × `g7e.8xlarge` in a third | Qwen3-Coder-30B-A3B, Qwen3-32B, Qwen3-30B-A3B-2507 in bf16, fp8, AWQ, NVFP4; gpt-oss-120b | BFCL v4 single and multi-turn (4,441), τ-bench retail and airline (164 tasks, 2 trials), SWE-bench Verified first 100 with mini-swe-agent, CoNLL-2003 extraction 1,000 sentences in three JSON modes; one bf16 configuration repeated for the noise floor; 1.5 to 4 h per configuration |
 | Gemma 4 (*Choosing a model to host*, *Reasoning models*, *Speculative decoding*, *`kvCacheDtype: fp8`*, *Tensor parallelism*): fit, kernels, bf16, fp8, NVFP4, the publisher's int4, thinking, the MTP drafter on 0.29.0, quality; on H100s the KV precision by kernel, TP=1, 2 and 4 over NVLink, and the Qwen reference repeated | one `g7e.2xlarge` in three regions, one `p5.48xlarge` | Gemma 4 26B-A4B MoE, 31B dense, 12B encoder-free; Qwen3-30B-A3B-2507 fp8 | same matrix, 1 to 64 per engine and 64 to 512 per host; lm-eval log-likelihood tasks chat-wrapped, GSM8K 500, IFEval 541 |
