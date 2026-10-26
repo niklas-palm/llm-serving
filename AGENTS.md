@@ -155,7 +155,7 @@ Walk them through this order and check each step before the next.
 4. **Build, then deploy.** `build_image.py --write-config`, then `cdk deploy`. Three to five minutes
    into the deploy, read the ASG scaling activities. `InsufficientInstanceCapacity` or
    `UnfulfillableCapacity` will not resolve soon: cancel the update, switch purchase model or region,
-   deploy again. Do not let CloudFormation wait; it will, for up to an hour, and a crash-looping engine
+   deploy again. Do not let CloudFormation wait; it will, for up to three hours, and a crash-looping engine
    locks the stack for longer.
 5. **Confirm.** `endpoint_info.py`, then the smoke-test command it prints. If tool calling was asked
    for, send one request with a `tools` array and check that `tool_calls` comes back, not text. Then

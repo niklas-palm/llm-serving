@@ -178,6 +178,7 @@ hfTokenSecretName: ""
 # Set this if your model is not roughly 30B parameters. The tensor-parallel degree is derived from it.
 # A 70B model left at 30 derives tensorParallel: 1, deploys, and runs out of VRAM loading weights.
 # `cdk synth` prints the assumed size and the degree it chose. Count parameters, not file size.
+# docs/tuning.md, "Will my model fit?".
 estimatedParamsBillions: 30
 
 
@@ -206,6 +207,7 @@ toolCallParser: ""
 # openai_gptoss (gpt-oss), gemma4 (Gemma 4), deepseek_r1. Not needed with thinking off (see extraArgs below),
 # except for Gemma 4: it writes an empty thought block after a tool turn even with thinking off, and without
 # the parser that block lands in the answer text. Set it whenever toolCallParser is gemma4.
+# docs/tuning.md, "Reasoning models" and "Tool calling".
 reasoningParser: ""
 
 # Optional. Flags appended to `vllm serve`, for anything this project does not model. Split like a
@@ -245,7 +247,7 @@ tuning:
 
   # Ceiling on concurrent sequences per engine, not a reservation; N engines hold N x this. Keep it
   # above the concurrency each engine will see, or the flag is what you measure: one TP=8 engine given
-  # 512 requests queued half of them.
+  # 512 requests queued half of them. docs/tuning.md, "maxNumSeqs".
   maxNumSeqs: 256
 
   # Token budget per scheduler step. 0 = engine default. No measured effect from 8k to 64k, on one GPU
@@ -256,14 +258,16 @@ tuning:
   # Fraction of each GPU vLLM may claim. 0.95 measured +27% over the 0.90 default (the KV cache is
   # what remains after the weights). 0.97 gained +1.6% and crashed a dense model under load.
   # Leave at 0.95 with unquantised weights too; the fix for that case is kvCacheDtype: auto.
+  # On 80 GB cards, start at 0.90 for a large mixture-of-experts or a draft head: both died at 0.95.
   # docs/tuning.md, "gpuMemoryUtilization: 0.95".
   gpuMemoryUtilization: 0.95
 
   # KV cache precision, independent of weight precision. "fp8" measured +12% decode, growing with
   # concurrency. "auto" keeps the model's precision.
   # On this GPU (FlashInfer attention) fp8 won every shape, long cached prompts included (+18 to 39%).
-  # On H100s (FlashAttention) the same shape ran 20 to 30% faster with "auto". Kernel-dependent, so
-  # measure it on yours. docs/tuning.md, "kvCacheDtype".
+  # On H100s a 235B MoE at TP=4 ran cached 4k prompts 20 to 30% faster with "auto", and Gemma 4 got a
+  # faster attention kernel with it; the 30B did not. Model- and kernel-dependent, so measure it on
+  # yours. docs/tuning.md, "kvCacheDtype".
   # With unquantised weights use "auto": fp8 packs more tokens in, batches grow, and it runs out of
   # VRAM under load. `cdk synth` warns when the weights fill more than half the card.
   # Some models refuse fp8 here and fail at start (Qwen3.8-Flash-Next: "requires a BF16 main KV cache");
@@ -272,21 +276,24 @@ tuning:
 
   # Reuse attention state across requests sharing a prompt prefix. Leave on: -1.2% when nothing
   # shares a prefix. Figures in the docs are unique-prompt; every prompt cached measured +46% on 1k
-  # prompts and 2.7x on 4k prompts for the MoE, and nothing on a dense model (decode is its wall).
-  # docs/tuning.md, "Choosing an operating concurrency".
+  # prompts and 2.7x on 4k prompts for the MoE, nothing on a dense 27B (decode is its wall), and 2x for
+  # 8B dense models on H100s. docs/tuning.md, "enablePrefixCaching: true".
   enablePrefixCaching: true
 
   # Mixture-of-experts only: pin whole experts to GPUs instead of sharding each across them.
   # Measured -13% in FP8 and +15% in bf16 on two GPUs; -7 to -20% in bf16 on eight. Measure it: one
   # flag, one restart. Required for block-quantised FP8 at a degree that would split an expert's tiles.
+  # Do not force --moe-backend across the switch: each layout gets its own kernel, and a forced one
+  # cost 20 to 25%. docs/tuning.md, "enableExpertParallel: false".
   enableExpertParallel: false
 
   # Mixture-of-experts only, with enableExpertParallel on: attention groups inside ONE engine, each with
   # its own request batch, sharing the experts sharded across all of the engine's tensorParallel x
   # dataParallel GPUs. The load balancer then sees one target per engine. 1 = off. Refused without
   # expert parallelism, where it is only replicas with more overhead. Lost to separate engines for
-  # Qwen3; the exception is MLA models (DeepSeek), where it multiplies the KV cache 2.8-4.2x.
-  # docs/tuning.md, "Topology: replicas or tensor parallelism?".
+  # Qwen3; the exception is MLA models (DeepSeek), where it multiplies the KV cache 2.8-4.2x and wins
+  # on long unique prompts, while tensor parallelism wins cached ones.
+  # docs/tuning.md, "Topology: replicas or tensor parallelism?" and "The exception: MLA models".
   dataParallel: 1
 
   # Independent engines per instance, load-balanced by the ALB.
