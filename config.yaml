@@ -115,6 +115,13 @@ useSpot: false
 # 30 minutes before it ends, so park before then. README.md, "Capacity Blocks".
 capacityBlockId: ""
 
+# Minutes ECS waits before it acts on a new task's failing health checks. A task still loading past
+# this is replaced, and the replacement starts loading from the beginning. 30 was enough for every model
+# measured here up to Beam-1.0-501B (503 GB, 22 minutes deploy to healthy); DeepSeek-V4.1-Flash on eight
+# B200s needed about 60 on its first start.
+# 5 to 240. docs/tuning.md, "Health-check grace for a slow first start".
+healthCheckGraceMinutes: 30
+
 # ---------------------------------------------------------------------------- observability
 
 # Every deployment gets a CloudWatch dashboard and two alarms (engines unhealthy, load balancer

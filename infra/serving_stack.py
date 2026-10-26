@@ -790,6 +790,12 @@ service:
             resources=[log_group.log_group_arn, log_group.log_group_arn + ":*"]))
 
         tasks = instance_count * tuning["replicas"]
+        # How long ECS ignores a new task's failing health checks before it replaces the task. A large model's
+        # first start can outlast the old fixed 30 minutes: DeepSeek-V4.1-Flash on eight B200s answered its
+        # first health check about 60 minutes after the task started, most of it kernel autotuning, and ECS
+        # replaced it at minute 30. docs/tuning.md, "Health-check grace for a slow first start".
+        grace_minutes = _num(_given(cfg.get("healthCheckGraceMinutes"), 30), "healthCheckGraceMinutes",
+                             minimum=5, maximum=240)
         service = ecs.Ec2Service(
             self, "Service",
             cluster=cluster,
@@ -830,7 +836,7 @@ service:
             # operator is watching and GPUs are scarce; turn it on for an unattended fleet with spare
             # capacity. See docs/troubleshooting.md.
             circuit_breaker=None,
-            health_check_grace_period=Duration.minutes(30),
+            health_check_grace_period=Duration.minutes(grace_minutes),
         )
         service.attach_to_application_target_group(target_group)
 
