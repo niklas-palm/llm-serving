@@ -1356,7 +1356,19 @@ under load. It removes prefill work only; decode still re-reads the whole cache 
 does nothing at concurrency 1.
 
 **Leave it on whatever your workload.** Turning it off on prompts that share nothing measured
-**−1.2%**.
+**−1.2%**. Repeated on eight H100s, one engine per GPU, vLLM 0.29.0, 1k prompts, 512 in flight
+(c17h-*-pc-*), with the hit counters read from every engine:
+
+| Model | Prompts | Caching on | Caching off | Prompt tokens served from cache |
+|---|---|---|---|---|
+| Llama 3.1 8B | unique | 157.5 rps | 154.2 | 3.3% (the chat template's fixed start) |
+| Llama 3.1 8B | one shared 1k prefix | 306.4 | 155.3 | 99.1% |
+| Qwen3-8B | unique | 151.6 | 150.9 | 0% |
+| Qwen3-8B | one shared 1k prefix | 289.4 | 153.2 | 99.9% |
+
+On unique prompts the cost is within noise for both families; on a fully shared prefix the same engines
+serve about twice the requests. The cache saves the prefill, so the gain is the prefill's share of the
+work: 1k-token prompts with 190-token answers.
 
 **The caveat is about concurrency, not the flag.** Every throughput figure here was measured with
 prompts that share a prefix; *Choosing an operating concurrency* gives both numbers. Sizing a fleet from
@@ -1780,7 +1792,9 @@ thousand tokens:
 
 Qwen3.8's ~940-token prompts held one block, and MTP gave it back. So on hybrid models short cached
 prompts get nothing from the prefix cache, and a drafter costs one block per request; long prompts keep
-most of it. Read `vllm:prefix_cache_hits_total` before trusting a cached benchmark with a drafter on.
+most of it. Two more Gated DeltaNet hybrids on H100s showed the same with their defaults: a shared 1k
+prefix served about what unique prompts did (at 512 in flight Sage-A1.5 73.9 against 69.5 rps, Ornith-1.5-122B
+42.3 against 42.0; c17h-sage, c17h-ornith). Read `vllm:prefix_cache_hits_total` before trusting a cached benchmark with a drafter on.
 
 **On vLLM 0.30.0 `disable_eagle_block_drop` keeps that block, and the drafter then pays on cached long
 prompts.** It goes in the speculative config:
@@ -2581,6 +2595,7 @@ Conditions that change between sections are stated where they matter; the campai
 | Agentic quality of every precision (*What quantisation costs an agent*, *Tool calling*) | 4 × `g7e.2xlarge` in two regions, 2 × `g7e.8xlarge` in a third | Qwen3-Coder-30B-A3B, Qwen3-32B, Qwen3-30B-A3B-2507 in bf16, fp8, AWQ, NVFP4; gpt-oss-120b | BFCL v4 single and multi-turn (4,441), τ-bench retail and airline (164 tasks, 2 trials), SWE-bench Verified first 100 with mini-swe-agent, CoNLL-2003 extraction 1,000 sentences in three JSON modes; one bf16 configuration repeated for the noise floor; 1.5 to 4 h per configuration |
 | Gemma 4 (*Choosing a model to host*, *Reasoning models*, *Speculative decoding*, *`kvCacheDtype: fp8`*, *Tensor parallelism*): fit, kernels, bf16, fp8, NVFP4, the publisher's int4, thinking, the MTP drafter on 0.29.0, quality; on H100s the KV precision by kernel, TP=1, 2 and 4 over NVLink, and the Qwen reference repeated | one `g7e.2xlarge` in three regions, one `p5.48xlarge` | Gemma 4 26B-A4B MoE, 31B dense, 12B encoder-free; Qwen3-30B-A3B-2507 fp8 | same matrix, 1 to 64 per engine and 64 to 512 per host; lm-eval log-likelihood tasks chat-wrapped, GSM8K 500, IFEval 541 |
 | KV cache offload to host memory (*Offloading the cache to host memory moves the capacity wall*) | one `g7e.4xlarge` (128 GiB host RAM) in eu-west-2 | 30B MoE fp8 | six-turn conversations of 8,000 tokens, streamed, 120 to 240 s per level, 32 to 224 conversations in flight; host tier 0 or 32 GiB; one run with the GPU cache pinned to 81,376 tokens |
+| Prefix caching on and off with hit counters (*`enablePrefixCaching: true`*), vLLM 0.29.0 | one `p5.48xlarge` (8 × H100) spot in ap-northeast-1 | Llama 3.1 8B, Qwen3-8B (bf16) | eight engines × TP=1, 512 in flight per host, unique and shared-prefix 1k prompts |
 | The move to vLLM 0.29.0 (*What happens when a container is overloaded*) | one `g7e.2xlarge` in ap-south-1 | 30B MoE fp8, plain and with EAGLE-3, both engines on the same host; on 0.29.0 against earlier 0.28.0 rows: dense 32B fp8, 120B MXFP4 (also both engines), Gemma 4 26B NVFP4 and 12B W4A16; the 30B quality suite | the single-engine matrix, 8 to 64 in flight; overload at 64 to 512 with and without `--max-num-queued-reqs`; same kernels chosen on both engines, most rows within 5%, none beyond 11%, quality scores within one standard error |
 | fp8 kernels on B200 and MTP with `disable_eagle_block_drop` (*On B200s, check the fp8 kernel*, *Speculative decoding*), vLLM 0.29.0 to 0.32.0 | one `p6-b200.48xlarge` (8 × B200) spot in ap-south-1 | Llama 3.1 8B bf16 and fp8 (ModelOpt), Qwen3.8-27B bf16 and fp8, LFM2.5-24B-A2B | eight engines × TP=1, 64 to 512 in flight per host, 60 s per level, `--ignore-eos`; prefill timed one request at a time; one prefill step profiled with vLLM's torch profiler |
 | Large models on Capacity Blocks, vLLM 0.30.0 (*Topology*, *Speculative decoding*, *NVFP4*, *Image inputs*, *Engine tuning*) | one `p6-b200.48xlarge` (8 × B200), one `p5.48xlarge` (8 × H100) | DeepSeek-V4 Flash and Pro, GLM-5.3 and GLM-5.3-Flash, Kimi-K2.6, MiniMax-M2.7, Qwen3.8-Flash-Next, Qwen3-Coder-480B, Step-3.7-Flash; Qwen3-30B, Qwen3-235B and gpt-oss-120b repeated | same matrix, 64 to 512 per host; long prompts to 32k unique and cached; image inputs at 16 to 128 |
