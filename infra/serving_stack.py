@@ -586,7 +586,7 @@ class ServingStack(Stack):
                             host=ecs.Host(source_path=HOST_MODEL_CACHE))
 
         # Optional Hugging Face token for gated models, read from a Secrets Manager secret the user
-        # created (README, "Gated models"). Passed as an ECS secret, so it reaches the engine as HF_TOKEN
+        # created (README, "Gated model? Add your Hugging Face token"). Passed as an ECS secret, so it reaches the engine as HF_TOKEN
         # and never appears in the template, the outputs or the logs. Without it, public models work and
         # gated ones fail with a 401 while pulling.
         hf_secret_name = str(_given(cfg.get("hfTokenSecretName"), "")).strip()
