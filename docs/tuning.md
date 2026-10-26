@@ -2078,6 +2078,12 @@ see *Choosing an operating concurrency*.
 - **Wait for healthy, then warm up, then measure.** Benchmarking from the instant a target reports
   healthy understated throughput by ~21% here: the first requests pay for CUDA graph capture and kernel
   autotuning.
+  On an instance with several engines the per-level warm-up is not enough for the first shape after a
+  deploy. gpt-oss-120b on eight H100s (eight engines, vLLM 0.30.0, 20 s warm-up per level) ran the same
+  mixed shape first and again last on one deploy: 25.1 / 38.6 / 46.6 / 70.1 rps at 64 / 128 / 256 / 512
+  in flight the first time, 26.9 / 43.0 / 61.4 / 83.7 the second (7 to 24% low the first time). The load
+  balancer split requests evenly across engines (within 0.5%), so it was the engines, not the routing.
+  When you compare shapes, run a throwaway shape first or repeat the first one at the end (c17h-oss-mix).
 - **If throughput FALLS as you add concurrency, suspect your load generator.** A real server plateaus;
   it does not halve. One Python process driving 768 connections measured **33,688 tok/s against a true
   95,645** (53,492 at 384, then 33,688 at 768); 12 processes gave the correct answer. Even at 384 the
@@ -2529,6 +2535,7 @@ Conditions that change between sections are stated where they matter; the campai
 |---|---|---|---|
 | Single- and two-GPU topology, CPU, quantisation, EAGLE-3 on the 30B, autoscaling, fleet linearity | 1 to 8 × `g7e.2xlarge`, one `g7e.12xlarge` | 30B MoE fp8, bf16, AWQ, load-time fp8 | 60 to 120 s per level after warm-up, 64 to 1,920 in flight per fleet |
 | Every weight option, model families, EAGLE-3 on the 120B | 8 × `g7e.2xlarge` | 30B MoE, 27B dense (bf16, fp8, NVFP4), 120B MXFP4 (Marlin kernel), 120B NVFP4 hybrid | same matrix, 64 to 512 per fleet |
+| A cold first shape on an eight-engine host (*If you are benchmarking this yourself*), vLLM 0.30.0 | one `p5.48xlarge` (8 × H100) spot in ap-northeast-1 | gpt-oss-120b MXFP4 | eight engines × TP=1, shapes mix, ref, mix again on one deploy, 64 to 512 in flight per host |
 | H100 comparison, multi-GPU topologies (TP, EP, DP) | one `p5.48xlarge` (8 × H100) | the same, plus a 235B MoE in fp8 and bf16 | same matrix, 64 to 512 per host |
 | Routing and the prefix cache, decode ceilings and the memory-controller measurement, KV precision by kernel, CUDA graph mode, warm restart, dynamic speculation, dense contrast, quality | 1 and 8 × `g7e.2xlarge` | 30B MoE fp8, 27B dense, 120B MXFP4 | streamed, 1 to 128 per engine, 60 to 120 s per level |
 | Repeatability across regions and days, long prompts to 64k, KV precision by context length, structured output, the 8B and 32B dense points, the 80B hybrid MoE on one GPU and at TP=2 with its MTP head, quality on two tasks for eleven configurations | one `g7e.2xlarge` in three regions, one `p5.48xlarge` | 30B MoE, 8B, 27B, 32B dense, 80B hybrid MoE, 120B MXFP4 | streamed, 90 s levels, 1 to 256 in flight; lm-eval gsm8k 500 and ifeval 541 |
