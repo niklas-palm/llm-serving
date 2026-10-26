@@ -1404,6 +1404,19 @@ def test_sticky_sessions_is_a_cookie_on_the_target_group_and_off_by_default():
         synth(stickySessions="yes please")
 
 
+def test_the_health_check_grace_follows_the_config_and_defaults_to_30_minutes():
+    """DeepSeek-V4.1-Flash's first start on eight B200s answered its first health check about 60 minutes
+    after the task started; with a fixed 30-minute grace ECS marked it unhealthy and started a replacement."""
+    assert only(synth(), "AWS::ECS::Service")["HealthCheckGracePeriodSeconds"] == 1800
+    assert only(synth(healthCheckGraceMinutes=75), "AWS::ECS::Service")["HealthCheckGracePeriodSeconds"] == 4500
+
+
+@pytest.mark.parametrize("value", [0, 4, 241, 30.5, "soon"])
+def test_a_health_check_grace_outside_5_to_240_whole_minutes_is_refused(value):
+    with pytest.raises(ConfigError, match="healthCheckGraceMinutes"):
+        synth(healthCheckGraceMinutes=value)
+
+
 def test_the_measured_thresholds_and_timeouts_are_the_ones_deployed():
     """Every value here was set after a failure: the health check that marked a loading engine failed,
     the alarm window that cried wolf during deploys, the volume throughput that made loading take

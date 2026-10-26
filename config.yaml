@@ -115,6 +115,14 @@ useSpot: false
 # 30 minutes before it ends, so park before then. README.md, "Capacity Blocks".
 capacityBlockId: ""
 
+# Minutes ECS waits, from the moment a task starts, before it acts on the task's failing health checks.
+# A task still loading past this is replaced, and the replacement starts loading from the beginning. The
+# clock starts with the task, not the deploy: the longest deploy to healthy measured without a replacement
+# was Kimi-K2.6 at 2 x TP4 on eight B200s, 41 minutes. DeepSeek-V4.1-Flash on eight B200s needed about 60
+# minutes from task start on its first start; ECS started a replacement at minute 30.
+# 5 to 240. docs/tuning.md, "Health-check grace for a slow first start".
+healthCheckGraceMinutes: 30
+
 # ---------------------------------------------------------------------------- observability
 
 # Every deployment gets a CloudWatch dashboard and two alarms (engines unhealthy, load balancer

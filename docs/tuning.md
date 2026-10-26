@@ -2366,6 +2366,28 @@ Each description says what the alarm means and what to check.
 Set `alarmTopicArn` to notify an SNS topic. None is created for you: a topic with no subscription
 looks like a working notification and is not one.
 
+### Health-check grace for a slow first start
+
+`healthCheckGraceMinutes` (default 30) is how long ECS ignores a new task's failing health checks,
+counted from the moment the task starts. After that, a task that is still loading counts as unhealthy,
+and ECS stops it and starts a replacement, which loads from the beginning. The load balancer's own
+health check is separate: it only decides whether a task gets traffic.
+
+Because the clock starts with the task, a deploy can take longer than the grace without a replacement:
+CloudFormation and the rollout come before it. The longest deploy to healthy measured here without a
+replacement was Kimi-K2.6 at 2 × TP=4 on eight B200s, 41 minutes, of which the weights alone were 22 to
+25 minutes per engine. DeepSeek-V4.1-Flash did not fit: on eight B200s, vLLM 0.32.0, its first start
+answered the first health check about 60 minutes after the task started. Most of that time
+was FlashInfer autotuning its kernels (`[AutoTuner]: Tuning mxfp8_gemm` in the log); loading the weights
+was a small part of it. At minute 30 ECS marked the task unhealthy and started a replacement. Here the
+replacement could not be placed (`TaskFailedToStart: RESOURCE:GPU`, because the first task still held
+all eight GPUs), so the first task finished starting and served. With spare GPUs in the fleet the
+replacement would have started and begun loading again.
+
+Set it above the first start you measure: the time from `has started 1 tasks` in the ECS service events
+to the first healthy target. Whether a second start of the same model on the same host is faster (an
+autotuner cache) was not measured.
+
 ### Engine metrics: what the load balancer cannot see
 
 The numbers that say *why* the fleet is slow are on vLLM's Prometheus endpoint at `/metrics`. A

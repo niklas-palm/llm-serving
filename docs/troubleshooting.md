@@ -310,6 +310,18 @@ shows this.
 
 ---
 
+## Symptom: `replaced 1 tasks due to an unhealthy status` while the engine is still loading
+
+The service events say `Amazon ECS replaced 1 tasks due to an unhealthy status` about 30 minutes after
+`has started 1 tasks`, and the task's log shows it still starting (weights loading, or kernel autotuning
+such as `[AutoTuner]: Tuning ...`), not crashing. The start took longer than the health-check grace.
+Seen on DeepSeek-V4.1-Flash's first start on eight B200s (about 60 minutes). If the replacement finds
+no free GPUs it waits with `TaskFailedToStart: RESOURCE:GPU` and the first task can still finish; if it
+finds them, it starts loading again.
+
+**Fix:** raise `healthCheckGraceMinutes` above the measured start and deploy. docs/tuning.md, "Health-check
+grace for a slow first start".
+
 ## Symptom: `TaskFailedToStart`, no exit code, no container reason
 
 **Cause A: the container memory limit is too small for the model.**
