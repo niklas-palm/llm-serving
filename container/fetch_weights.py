@@ -206,7 +206,9 @@ def main(repo: str) -> int:
 
     with open(os.path.join(base, ".fetch_weights.lock"), "w") as lockfile:
         fcntl.flock(lockfile, fcntl.LOCK_EX)   # one task per host downloads; the others wait, then find it done
-        log(f"{repo} at {rev[:12]}: {len(files)} files, {total / 2**30:.1f} GiB")
+        waited, t0 = time.time() - t0, time.time()   # the times below are this task's own work, not the wait
+        log(f"{repo} at {rev[:12]}: {len(files)} files, {total / 2**30:.1f} GiB"
+            + (f" (waited {waited:.0f} s for another task on this instance)" if waited > 1 else ""))
         # Two pools: files wait on their ranges, so ranges need workers of their own.
         with ThreadPoolExecutor(CONNECTIONS) as ranges_pool, ThreadPoolExecutor(8) as files_pool:
             for fut in [files_pool.submit(one, f) for f in sorted(files, key=lambda f: -f["size"])]:
