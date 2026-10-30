@@ -36,8 +36,10 @@ HUB = "https://huggingface.co"
 RANGE_BYTES = 1 << 30   # each file is fetched as byte ranges of this size
 CONNECTIONS = 16        # ranges in flight at once, over all files (one connection gave ~50 MB/s)
 STALL_SECONDS = 60      # a read that gets no data for this long is retried from the byte it reached
-MIN_RATE = 5 << 20      # bytes/s; a connection slower than this over SLOW_WINDOW s is dropped and resumed on a new
-SLOW_WINDOW = 30        # one (some CDN connections trickle: on a B200 host two stayed under 1 MB/s for minutes)
+MIN_RATE = 1 << 20      # bytes/s; a connection slower than this over SLOW_WINDOW s is dropped and resumed on a new
+SLOW_WINDOW = 30        # one (some CDN connections trickle: on a B200 host two stayed under 1 MB/s for minutes).
+                        # Low on purpose: 16 connections at this rate is only 16 MB/s, so a slow but working link
+                        # is not mistaken for trickling ones.
 TRIES = 20              # per range
 
 
