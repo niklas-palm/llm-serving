@@ -1152,6 +1152,11 @@ Four things follow:
   about 14 of them; that, not compute, capped the batch there.
 - **The model's 262k context limit was never the limit; time to first token was.** `maxModelLen` only
   matters where the weights nearly fill the card (*`maxModelLen`*).
+- **128k on one GPU works; prefill is the limit there too.** Llama 3.1 8B FP8 on one B200 per engine
+  (eight engines, `maxModelLen: 131072`, fp8 KV, vLLM 0.32.0) held 2.6M tokens of KV per GPU and preempted
+  nothing at 16 × 126k per engine. A 126k prompt alone waited 3.3 s for its first token; at 16 per engine
+  33 s (p50); cached, 0.3 s alone and 1.9 s at 16, and the same lengths served 5 to 20× more requests
+  (c17c-l8-128k-b8k).
 
 ---
 
@@ -1511,6 +1516,12 @@ to give it a chance (a 235B mixture-of-experts at TP=4 on H100s, where 4,000-tok
 flat 7 rps from 64 to 512 in flight): 16,384 moved every shape by under 5%, inside run-to-run noise. The
 chunked-prefill budget is not what limits prefill; the tensor cores and the all-reduce are.
 
+**At long context a larger budget is slower.** Llama 3.1 8B FP8, one B200 per engine, `maxModelLen:
+131072`, unique 32k prompts at 4 per engine: 10.0 rps at 8,192 against 9.0 at 32,768, TTFT p95 2.1 against
+3.2 s, the same decode speed per request (c17c-l8-128k-*, c17d). The engine ran 14% fewer steps per second
+with the larger budget: a step that carries a whole 32k prompt takes longer, and every decoding request
+waits for it. Why one 32k chunk costs more per token than four 8k chunks was not profiled.
+
 **Raising it costs KV cache.** At startup the engine runs one step of the full budget to measure its
 peak working memory, and the KV cache gets what is left. DeepSeek-V4-Flash at TP=4 on H100s: 30.8 GiB of
 KV per GPU at the default 8,192, 22.1 GiB at 32,768, and at that size its 1M default context no longer
@@ -1686,6 +1697,16 @@ seven draft tokens), the same layout on eight B200s and on eight H100s, vLLM 0.3
 
 The H100 has about half the B200's tensor throughput. Less spare compute, an earlier break-even: the
 rule above, on a third kind of drafter.
+
+**Under load a drafter costs its rejected drafts.** DeepSeek-V4.1-Flash with its DSpark drafter (five draft
+tokens), one engine × TP=8 on eight B200s, vLLM 0.32.0, 1k prompts: 16.1 / 19.7 / 22.9 / 23.4 rps at 64 / 128 / 256 /
+512 in flight, against 45.5 at 256 without the drafter (c17d-dspark, c17c-dsv41-tp8). The engine's metrics show
+why: each running request adds six tokens to every step (its own and five drafts) and keeps about 2.7 of them, at
+34% draft acceptance on these random prompts. As the batch grows, the work per step grows with it (~1,000 tokens per
+step at 64 in flight, ~4,000 at 256) while the output does not, and generated tokens flatten at ~4,700 per second,
+against ~8,650 without the drafter. It is not a batch-size limit: 256 requests were running. With one request in
+flight the same drafter doubles the speed (351 against 165 tok/s per request, c17c-dsv41-dspark). Acceptance
+depends on the text (much higher on GSM8K than on random prompts), so measure it on your traffic.
 
 ### N-gram speculative decoding: measured **−58%**
 
@@ -2493,6 +2514,28 @@ fetcher writes the same cache layout. Tasks that share an instance take turns th
 downloads and the rest wait for it. A gated model without `hfTokenSecretName` fails at once with the hub's
 401. If the fetcher fails for any reason, the engine downloads the weights itself, as it did before.
 
+### Loading the weights: `--load-format fastsafetensors` for multi-GPU engines
+
+The default loader reads the safetensors files through the page cache. When the files are in memory (a restart on
+the same instance soon after) that takes seconds; when they are not (a new instance, or the cache was dropped), every
+GPU's worker process copies its experts out of the memory-mapped files, and the page faults behind those copies read
+the disk, in all eight workers at once. A profile of one worker during a cold load (py-spy, 354 samples) spent 68% in
+the per-expert copies and 15% reading tensors, with each worker at 7 to 15 CPU cores; the disk read far below its
+speed. Measured on DeepSeek-V4-Flash, 155 GiB, one engine × TP=8 on eight B200s, vLLM 0.32.0 (c17d-load-*):
+
+| `extraArgs` | Files not in memory | Files in memory |
+|---|---|---|
+| default | 461 s | 14 s |
+| `--load-format runai_streamer` | ~45 s | ~43 s |
+| `--load-format fastsafetensors` | ~13 s | ~12 s |
+
+fastsafetensors has each worker read only its share of the files with large direct reads, and the workers exchange
+tensors over the GPUs (it read 6 of the 48 files per worker), so a cold load is as fast as a warm one. The answers
+after a fastsafetensors load were checked (17 × 23, a translation). The Run:ai streamer streams at about the same speed
+cold or warm, so it beats the default only when the files are not in memory; its time is in the log's
+`Model loading took` line, not `Loading weights took`. Both packages are in the vLLM 0.32.0 image. Not measured:
+an engine on one GPU (one worker reads every file), or other model families.
+
 ### Engine metrics: what the load balancer cannot see
 
 The numbers that say *why* the fleet is slow are on vLLM's Prometheus endpoint at `/metrics`. A
@@ -2634,6 +2677,7 @@ Conditions that change between sections are stated where they matter; the campai
 | Every weight option, model families, EAGLE-3 on the 120B | 8 × `g7e.2xlarge` | 30B MoE, 27B dense (bf16, fp8, NVFP4), 120B MXFP4 (Marlin kernel), 120B NVFP4 hybrid | same matrix, 64 to 512 per fleet |
 | A cold first shape on an eight-engine host (*If you are benchmarking this yourself*), vLLM 0.30.0 | one `p5.48xlarge` (8 × H100) spot in ap-northeast-1 | gpt-oss-120b MXFP4 | eight engines × TP=1, shapes mix, ref, mix again on one deploy, 64 to 512 in flight per host |
 | Start time with and without FlashInfer autotuning, and the weight download (*Health-check grace for a slow first start*, *The weights download first, in parallel*), vLLM 0.32.0 | one `p6-b200.48xlarge` (8 × B200) spot in ap-south-1 | DeepSeek-V4.1-Flash-1017 fp8 | one engine × TP=8, `--block-size 128`, the same matrix with and without `--no-enable-flashinfer-autotune`, 64 to 512 in flight per host; starts timed from the task's start to its first healthy check |
+| Weight loaders, the drafter under load, and long context to 128k (*Loading the weights*, *How speculative decoding works*, *Long prompts*, *`maxNumBatchedTokens`*), vLLM 0.32.0 | one `p6-b200.48xlarge` (8 × B200) spot in ap-south-1 | DeepSeek-V4-Flash-0731, DeepSeek-V4.1-Flash-1017, Llama 3.1 8B FP8 | weight loads cold (page cache dropped) and warm per loader; DSpark at 64 to 512 in flight with engine metrics every 10 s; 8 × TP=1 at `maxModelLen: 131072`, 32k to 126k prompts unique and cached, 1 to 16 per engine |
 | H100 comparison, multi-GPU topologies (TP, EP, DP) | one `p5.48xlarge` (8 × H100) | the same, plus a 235B MoE in fp8 and bf16 | same matrix, 64 to 512 per host |
 | Routing and the prefix cache, decode ceilings and the memory-controller measurement, KV precision by kernel, CUDA graph mode, warm restart, dynamic speculation, dense contrast, quality | 1 and 8 × `g7e.2xlarge` | 30B MoE fp8, 27B dense, 120B MXFP4 | streamed, 1 to 128 per engine, 60 to 120 s per level |
 | Repeatability across regions and days, long prompts to 64k, KV precision by context length, structured output, the 8B and 32B dense points, the 80B hybrid MoE on one GPU and at TP=2 with its MTP head, quality on two tasks for eleven configurations | one `g7e.2xlarge` in three regions, one `p5.48xlarge` | 30B MoE, 8B, 27B, 32B dense, 80B hybrid MoE, 120B MXFP4 | streamed, 90 s levels, 1 to 256 in flight; lm-eval gsm8k 500 and ifeval 541 |
