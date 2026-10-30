@@ -203,6 +203,14 @@ def summarise(out: str, tag: str, model: str, csv_path: str = "") -> list[dict]:
         score = m[key]
         shown = f"{score:8.2f}" if task == "wikitext" else f"{100 * score:7.1f}%"
         print(f"{task:28} {key:30} {shown:>8} {100 * err:>5.1f} {n:>6}")
+        # strict-match only counts answers that end in the "#### 18" form the few-shot examples use. A model
+        # that writes "**Answer: 18**" scores near zero with every answer right: DeepSeek-V4.1-Flash 5.8%
+        # strict against 94.4% by its last number (c17c-dsv41-q). The row keeps strict-match, as every
+        # other row does; this says when to read the flexible score instead.
+        flexible = m.get("exact_match,flexible-extract")
+        if task == "gsm8k" and isinstance(flexible, (int, float)) and flexible - score > 0.2:
+            print(f"{'':28} {'exact_match,flexible-extract':30} {100 * flexible:7.1f}%   the model's answer "
+                  "format is not '#### N': strict-match understates it, read this line")
         rows.append({"tag": tag, "model": model, "task": task, "metric": key, "score": round(score, 4),
                      "stderr": round(err, 4), "n": n})
     if not rows:

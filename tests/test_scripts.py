@@ -420,6 +420,24 @@ def test_quality_summary_merges_harness_results_and_compare_counts_flipped_answe
     assert "gsm8k" in out and "50.0%" in out, "two of four shared questions flipped: one gained, one lost"
 
 
+def test_quality_says_when_gsm8k_strict_match_misses_the_answers(tmp_path, capsys):
+    """DeepSeek-V4.1-Flash scored 5.8% strict-match with 94.4% of its answers right: it ends with
+    "**Answer: N**", not "#### N" (c17c-dsv41-q). The row keeps strict-match; the summary must say so."""
+    import json as js
+    q = _load("quality")
+    g = tmp_path / "gen-gsm8k" / "m"; g.mkdir(parents=True)
+    (g / "results_1.json").write_text(js.dumps({"results": {"gsm8k": {
+        "exact_match,strict-match": 0.058, "exact_match,flexible-extract": 0.944}}}))
+    rows = q.summarise(str(tmp_path), "t", "m")
+    out = capsys.readouterr().out
+    assert rows[0]["metric"] == "exact_match,strict-match" and rows[0]["score"] == 0.058
+    assert "94.4%" in out and "not '#### N'" in out
+    (g / "results_1.json").write_text(js.dumps({"results": {"gsm8k": {
+        "exact_match,strict-match": 0.92, "exact_match,flexible-extract": 0.93}}}))
+    q.summarise(str(tmp_path), "t", "m")
+    assert "#### N" not in capsys.readouterr().out, "a normal model gets no note"
+
+
 def test_extraction_reads_bio_tags_parses_leniently_and_scores_mentions():
     """Entity-level scoring on (type, mention): a mention with the right text and the wrong type is both a
     false positive and a false negative, and a fenced or chatty answer still parses."""
