@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -41,8 +42,9 @@ TREE = [
 class FakeHub:
     """Serves the model API, resolve (with a redirect to a 'CDN' for the LFS file) and byte ranges."""
 
-    def __init__(self, gated=False, cut_first=0, corrupt=False, fail_after=None):
+    def __init__(self, gated=False, cut_first=0, corrupt=False, fail_after=None, slow_first=0):
         self.gated, self.cut_left, self.corrupt, self.fail_after = gated, cut_first, corrupt, fail_after
+        self.slow_left = slow_first
         self.cdn_auth = []   # Authorization headers the CDN saw: must stay empty
 
         hub = self
@@ -62,6 +64,16 @@ class FakeHub:
                 if hub.cut_left > 0:   # drop the connection half way, once per cut
                     hub.cut_left -= 1
                     self.wfile.write(part[: len(part) // 2])
+                    return
+                if hub.slow_left > 0:   # trickle: data keeps coming, far too slowly, until the client gives up
+                    hub.slow_left -= 1
+                    try:
+                        for i in range(0, len(part), 4096):
+                            self.wfile.write(part[i:i + 4096])
+                            self.wfile.flush()
+                            time.sleep(0.2)
+                    except OSError:
+                        pass
                     return
                 self.wfile.write(part)
 
@@ -187,3 +199,16 @@ def test_a_restarted_task_fetches_only_the_ranges_it_is_missing(fw, monkeypatch)
     hub.fail_after, before = None, len(hub.cdn_auth)
     assert fw.main("org/toy") == 0
     assert len(hub.cdn_auth) - before == len(fw.ranges(len(BIG))) - 2
+
+
+def test_a_connection_that_trickles_is_dropped_and_resumed(fw, monkeypatch):
+    """On a B200 host two CDN connections stayed under 1 MB/s for minutes without ever stalling, so the stall
+    timeout never fired and the start waited on them (c17d). A connection under the minimum rate is cut."""
+    monkeypatch.setattr(fw, "MIN_RATE", 2 << 20)
+    monkeypatch.setattr(fw, "SLOW_WINDOW", 0.3)
+    hub = FakeHub(slow_first=1)
+    base = _use(fw, monkeypatch, hub)
+    t = time.monotonic()
+    assert fw.main("org/toy") == 0
+    assert hub.slow_left == 0 and time.monotonic() - t < 20
+    assert open(os.path.join(base, "snapshots", REV, "sub", "model.safetensors"), "rb").read() == BIG
