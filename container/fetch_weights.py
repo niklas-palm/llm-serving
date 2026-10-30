@@ -36,6 +36,8 @@ HUB = "https://huggingface.co"
 RANGE_BYTES = 1 << 30   # each file is fetched as byte ranges of this size
 CONNECTIONS = 16        # ranges in flight at once, over all files (one connection gave ~50 MB/s)
 STALL_SECONDS = 60      # a read that gets no data for this long is retried from the byte it reached
+MIN_RATE = 5 << 20      # bytes/s; a connection slower than this over SLOW_WINDOW s is dropped and resumed on a new
+SLOW_WINDOW = 30        # one (some CDN connections trickle: on a B200 host two stayed under 1 MB/s for minutes)
 TRIES = 20              # per range
 
 
@@ -107,9 +109,16 @@ def fetch_range(repo: str, rev: str, path: str, dst: str, start: int, end: int) 
                     raise OSError(f"no byte range in the answer (HTTP {r.status})")
                 with open(dst, "r+b") as out:
                     out.seek(pos)
-                    while pos < end and (chunk := r.read(min(8 << 20, end - pos))):
+                    since, mark = time.monotonic(), pos
+                    # read1 returns what has arrived, so a slow connection shows as slow instead of blocking
+                    # inside one large read.
+                    while pos < end and (chunk := r.read1(min(1 << 20, end - pos))):
                         out.write(chunk)
                         pos += len(chunk)
+                        if (now := time.monotonic()) - since >= SLOW_WINDOW:
+                            if pos - mark < MIN_RATE * (now - since):
+                                raise OSError(f"{(pos - mark) / (now - since) / 2**20:.1f} MB/s, under the minimum")
+                            since, mark = now, pos
         except urllib.error.HTTPError as e:
             # No access (a gated model without a token) or no such file: retrying cannot help. A 403 from
             # the CDN is an expired signed URL, which the next attempt resolves again.
