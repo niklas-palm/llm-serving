@@ -407,7 +407,8 @@ same harness through the endpoint (`scripts/quality.py`: lm-evaluation-harness 0
 checkpoints are published with). Log-likelihood tasks over `/v1/completions`: MMLU 5-shot (50 per subject,
 2,850), ARC-Challenge 25-shot, HellaSwag 10-shot, Winogrande 5-shot, TruthfulQA mc2 (500 each), and
 WikiText word perplexity (60 documents). Generative tasks over chat completions, greedy, 1,024-token cap:
-GSM8K 5-shot (500) and IFEval (541). Thinking models were served with thinking off, and the harness sends the
+GSM8K 5-shot (500, strict-match: the answer must end in the few-shot examples' "#### N" form; `quality.py` says
+when the flexible score is far higher, as for DeepSeek-V4.1-Flash, 5.8% strict and 94.4% flexible) and IFEval (541). Thinking models were served with thinking off, and the harness sends the
 model's beginning-of-sequence token on the completions path when it has one (Gemma 4's tokenizer adds
 none by itself). Gemma 4's instruction-tuned checkpoints are out of distribution on raw text even then
 (a plain paragraph read perplexity 654 to 8,923 raw and 12 to 19 inside their chat turn), so their
