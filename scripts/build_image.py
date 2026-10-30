@@ -239,11 +239,11 @@ def upload_context(s3, bucket: str, account: str) -> str:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("buildspec.yml", BUILDSPEC)
-        for fn in ("Dockerfile", "serve"):
+        for fn in ("Dockerfile", "serve", "fetch_weights.py"):
             path = os.path.join(ROOT, "container", fn)
             if not os.path.exists(path):
                 sys.exit(f"missing container/{fn}")
-            # Explicit mode so `serve` is executable inside the build, independent of local
+            # Explicit mode so `serve` and the fetcher are executable inside the build, independent of local
             # permissions - a zip preserves what it is given, and a non-executable entrypoint
             # produces a container that starts and dies.
             info = zipfile.ZipInfo(fn)

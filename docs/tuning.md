@@ -2435,17 +2435,62 @@ health check is separate: it only decides whether a task gets traffic.
 Because the clock starts with the task, a deploy can take longer than the grace without a replacement:
 CloudFormation and the rollout come before it. The longest deploy to healthy measured here without a
 replacement was Kimi-K2.6 at 2 × TP=4 on eight B200s, 41 minutes, of which the weights alone were 22 to
-25 minutes per engine. DeepSeek-V4.1-Flash did not fit: on eight B200s, vLLM 0.32.0, its first start
-answered the first health check about 60 minutes after the task started. Most of that time
-was FlashInfer autotuning its kernels (`[AutoTuner]: Tuning mxfp8_gemm` in the log); loading the weights
-was a small part of it. At minute 30 ECS marked the task unhealthy and started a replacement. Here the
-replacement could not be placed (`TaskFailedToStart: RESOURCE:GPU`, because the first task still held
-all eight GPUs), so the first task finished starting and served. With spare GPUs in the fleet the
-replacement would have started and begun loading again.
+25 minutes per engine. DeepSeek-V4.1-Flash did not fit: on eight B200s, vLLM 0.32.0, its first start on a new host answered
+the first health check about 60 minutes after the task started (c17b-dsv41-tp8-b128). At minute 30 ECS
+marked the task unhealthy and started a replacement. Here the replacement could not be placed
+(`TaskFailedToStart: RESOURCE:GPU`, because the first task still held all eight GPUs), so the first
+task finished starting and served. With spare GPUs in the fleet the replacement would have started and
+begun loading again.
 
-Set it above the first start you measure: the time from `has started 1 tasks` in the ECS service events
-to the first healthy target. Whether a second start of the same model on the same host is faster (an
-autotuner cache) was not measured.
+That start had two slow parts, measured apart on a second host (c17c):
+
+| Part of the start | Time | What it is |
+|---|---|---|
+| Downloading 475 GiB of weights | ~90 min by the engine itself, still unfinished; the same method as the entrypoint's fetcher took 338 s for a 155 GiB model | see "The weights download first, in parallel" below |
+| FlashInfer autotuning | ~14 of the 16-17 minutes from task start to ready, with the weights on disk | timing each kernel variant at each batch size, on every start |
+| Everything else | weights 26-38 s from a warm page cache, CUDA graphs 20-64 s | |
+
+A second start on the same host was no faster (16.2 against ~17 minutes): the autotuner's choices are
+not kept between starts, so it runs again in full.
+
+**Autotuning off: a 2.8-minute start for 0-8% of throughput.** `extraArgs: "--no-enable-flashinfer-autotune"`
+makes FlashInfer use its built-in kernel choices instead of timing each one at start. Same host,
+same model, 1 × TP=8, rps against the autotuned engine (c17c-dsv41-tp8-noat against c17c-dsv41-tp8):
+
+| Traffic | Without autotuning |
+|---|---|
+| Long answers, 1 to 32 in flight | 1.00× |
+| Unique 4k prompts | 0.97 to 1.00× |
+| Mixed lengths | 0.94 to 0.96× |
+| Cached 1k and 4k prompts | 0.92 to 1.05× |
+
+Start: 2.8 minutes from task start to ready, against 16 to 17 with it. The autotuner buys a few percent
+at high load on cached and mixed traffic. Where restarts and scale-out time matter more, turn it off.
+Measured on this one model on B200s; on another model, compare both with your own traffic.
+
+Set the grace above the first start you measure: the time from `has started 1 tasks` in the ECS service
+events to the first healthy target.
+
+### The weights download first, in parallel
+
+Before the engine starts, the entrypoint runs `container/fetch_weights.py`. It fetches every file of the
+model into the shared cache on the instance over plain HTTPS, 16 byte-ranges at once, resumes a range that
+stalls, checks each file against the hash Hugging Face publishes for it, and logs progress
+(`[fetch_weights] ... 312.0 of 475.0 GiB`). Then the engine finds every file in the cache.
+
+The engine's own download was the slow part on large models. DeepSeek-V4.1-Flash (475 GiB, 83 files) sat for
+~90 minutes on a fresh B200 host, with nothing in the engine's log: 81 files were done, and the two of
+~95 GiB each were not (c17c-dsv41-tp8). One connection to Hugging Face's CDN gave 45-50 MB/s, at which each
+of those files takes over 30 minutes; how many connections the engine's downloader used for them was not
+checked. Fetched in 16 ranges at once,
+their last 112 GB took ~2.5 minutes, and with a prototype of this fetcher DeepSeek-V4-Flash (155 GiB)
+took 338 s and Sage-A1.5 (66 GiB) 71 s from the same host (c17c). One connection gave 45-50 MB/s; the network path was not
+the limit.
+
+A host that already has the files skips them, including files the engine itself downloaded earlier: the
+fetcher writes the same cache layout. Tasks that share an instance take turns through a lock file, so one
+downloads and the rest wait for it. A gated model without `hfTokenSecretName` fails at once with the hub's
+401. If the fetcher fails for any reason, the engine downloads the weights itself, as it did before.
 
 ### Engine metrics: what the load balancer cannot see
 
@@ -2587,6 +2632,7 @@ Conditions that change between sections are stated where they matter; the campai
 | Single- and two-GPU topology, CPU, quantisation, EAGLE-3 on the 30B, autoscaling, fleet linearity | 1 to 8 × `g7e.2xlarge`, one `g7e.12xlarge` | 30B MoE fp8, bf16, AWQ, load-time fp8 | 60 to 120 s per level after warm-up, 64 to 1,920 in flight per fleet |
 | Every weight option, model families, EAGLE-3 on the 120B | 8 × `g7e.2xlarge` | 30B MoE, 27B dense (bf16, fp8, NVFP4), 120B MXFP4 (Marlin kernel), 120B NVFP4 hybrid | same matrix, 64 to 512 per fleet |
 | A cold first shape on an eight-engine host (*If you are benchmarking this yourself*), vLLM 0.30.0 | one `p5.48xlarge` (8 × H100) spot in ap-northeast-1 | gpt-oss-120b MXFP4 | eight engines × TP=1, shapes mix, ref, mix again on one deploy, 64 to 512 in flight per host |
+| Start time with and without FlashInfer autotuning, and the weight download (*Health-check grace for a slow first start*, *The weights download first, in parallel*), vLLM 0.32.0 | one `p6-b200.48xlarge` (8 × B200) spot in ap-south-1 | DeepSeek-V4.1-Flash-1017 fp8 | one engine × TP=8, `--block-size 128`, the same matrix with and without `--no-enable-flashinfer-autotune`, 64 to 512 in flight per host; starts timed from the task's start to its first healthy check |
 | H100 comparison, multi-GPU topologies (TP, EP, DP) | one `p5.48xlarge` (8 × H100) | the same, plus a 235B MoE in fp8 and bf16 | same matrix, 64 to 512 per host |
 | Routing and the prefix cache, decode ceilings and the memory-controller measurement, KV precision by kernel, CUDA graph mode, warm restart, dynamic speculation, dense contrast, quality | 1 and 8 × `g7e.2xlarge` | 30B MoE fp8, 27B dense, 120B MXFP4 | streamed, 1 to 128 per engine, 60 to 120 s per level |
 | Repeatability across regions and days, long prompts to 64k, KV precision by context length, structured output, the 8B and 32B dense points, the 80B hybrid MoE on one GPU and at TP=2 with its MTP head, quality on two tasks for eleven configurations | one `g7e.2xlarge` in three regions, one `p5.48xlarge` | 30B MoE, 8B, 27B, 32B dense, 80B hybrid MoE, 120B MXFP4 | streamed, 90 s levels, 1 to 256 in flight; lm-eval gsm8k 500 and ifeval 541 |

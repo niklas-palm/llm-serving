@@ -754,6 +754,25 @@ on H100s: 30.8 GiB per GPU at 8,192, 22.1 GiB at 32,768).
 
 ---
 
+## Symptom: a first start looks stuck before the engine logs anything
+
+On a new instance the task runs for many minutes before the engine's first line. The entrypoint is
+downloading the weights first, and its progress is in the same log:
+
+```
+[fetch_weights] 10:12:40 model-00047-of-00083.safetensors ready; 312.0 of 475.0 GiB, 402 s
+```
+
+Large checkpoints take minutes at several hundred MB/s (155 GiB took 338 s on a B200 host). If the
+lines stop for longer than a few minutes, look for `retry` lines: each says which file and byte range
+failed and why. `401` means a gated model without `hfTokenSecretName`. If the fetcher gives up, the log
+says `fetch_weights.py did not finish; the engine downloads the weights itself`, and the engine's own
+download follows, which logs nothing until it is done and can take far longer on files of tens of GiB
+(docs/tuning.md, "The weights download first, in parallel"). Raise `healthCheckGraceMinutes` above the
+download plus the start, or ECS replaces the task part way through.
+
+---
+
 ## Symptom: model loading takes far longer than expected
 
 **Cause A: the first task on a new instance is downloading the weights from Hugging Face.** Tens of

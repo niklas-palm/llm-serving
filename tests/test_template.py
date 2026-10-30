@@ -1231,6 +1231,18 @@ def test_unparseable_extra_args_stop_the_start_instead_of_being_dropped(tmp_path
     assert code != 0 and argv == [] and "not shell-parseable" in err
 
 
+def test_the_weights_are_fetched_before_the_engine_and_a_failed_fetch_does_not_stop_it(tmp_path):
+    """fetch_weights.py runs first with the model id; if it fails, the engine still starts and downloads
+    the weights itself, which is how every start worked before it."""
+    fake = tmp_path / "bin"; fake.mkdir()
+    log = tmp_path / "fetched"
+    (fake / "fetch_weights.py").write_text(f'#!/bin/bash\necho "$1" > {log}\nexit 3\n')
+    (fake / "fetch_weights.py").chmod(0o755)
+    code, argv, err = _run_entrypoint(tmp_path)
+    assert log.read_text().strip() == "org/model"
+    assert code == 0 and "--model" in argv and "engine downloads the weights itself" in err
+
+
 def test_whitespace_only_extra_args_add_nothing(tmp_path):
     code, argv, _ = _run_entrypoint(tmp_path, EXTRA_ARGS="   ")
     assert code == 0 and "" not in argv

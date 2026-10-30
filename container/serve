@@ -34,6 +34,14 @@ export VLLM_ENABLE_STARTUP_PLAN="${VLLM_ENABLE_STARTUP_PLAN:-1}"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${SHARED_CACHE}/triton}"
 export TILELANG_CACHE_DIR="${TILELANG_CACHE_DIR:-${SHARED_CACHE}/tilelang}"
 
+# Fetch the weights into the cache first, over parallel byte ranges with resume and a hash check per
+# file. The engine's own download of a 475 GiB checkpoint sat ~90 minutes, silent, on its two files of
+# ~95 GiB (docs/tuning.md, "The weights download first, in parallel"). A host that has the files skips
+# this. If it fails, the engine downloads them itself, as before.
+if ! fetch_weights.py "${MODEL_ID:?MODEL_ID is required}"; then
+  echo "[serve] fetch_weights.py did not finish; the engine downloads the weights itself" >&2
+fi
+
 ARGS=(
   # Also the served model name: /v1/models reports it and gateways route by it.
   --model "${MODEL_ID:?MODEL_ID is required}"
