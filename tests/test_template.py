@@ -1385,6 +1385,16 @@ def test_extra_env_reaches_the_engine_and_cannot_shadow_the_stack_variables():
     assert "EXTRA_ENV" not in {e["Name"] for e in vllm_container(synth())["Environment"]}, "empty adds nothing"
 
 
+def test_g7e_engines_run_fp8_experts_on_triton_and_extra_env_can_turn_deepgemm_back_on():
+    """vLLM picks DeepGEMM for block-fp8 experts, and on g7e it served 0.78x of Triton's request rate (vLLM 0.32.0,
+    Qwen3-30B-A3B-2507-FP8), so a publisher's fp8 build ran slower than the same model quantised at load time."""
+    env = lambda t: {e["Name"]: e["Value"] for e in vllm_container(t)["Environment"]}  # noqa: E731
+    assert env(synth())["VLLM_MOE_USE_DEEP_GEMM"] == "0"
+    assert env(synth(extraEnv={"VLLM_MOE_USE_DEEP_GEMM": "1"}))["VLLM_MOE_USE_DEEP_GEMM"] == "1", "extraEnv wins"
+    for other in ("p5.48xlarge", "p6-b200.48xlarge"):
+        assert "VLLM_MOE_USE_DEEP_GEMM" not in env(synth(instanceType=other)), f"{other} was not measured with it"
+
+
 def test_data_parallel_reaches_the_container_as_a_gpu_reservation_and_a_flag():
     """dp attention groups need tp x dp GPUs in one container, and the entrypoint passes the size on."""
     c = vllm_container(synth(instanceType="p5.48xlarge", estimatedParamsBillions=235, quantization="fp8",

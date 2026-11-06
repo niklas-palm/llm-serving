@@ -44,8 +44,8 @@ from constructs import Construct
 
 from hardware import (DEFAULT_OUTPUT_TOKEN_BANDS, DEFAULT_PROMPT_TOKEN_BANDS, ROOT_VOLUME_GIB,
                       ROOT_VOLUME_IOPS, ROOT_VOLUME_THROUGHPUT_MBPS, ConfigError, _flag, _given, _list,
-                      _mapping, _num, bytes_per_param_for, get_instance, memory_pressure_warning, model_bytes,
-                      resolve_topology, validate_token_bands)
+                      _mapping, _num, bytes_per_param_for, engine_env_defaults, get_instance,
+                      memory_pressure_warning, model_bytes, resolve_topology, validate_token_bands)
 
 CONTAINER_PORT = 8080
 
@@ -644,6 +644,9 @@ class ServingStack(Stack):
             if not isinstance(value, (str, int, float)):   # bool is an int; rendered as true/false
                 raise ConfigError(f"extraEnv: {name} must be a string or number (got {value!r}).")
             env[str(name)] = str(value).lower() if isinstance(value, bool) else str(value)
+        # After extraEnv, so a value written there wins over the GPU's default.
+        for name, value in engine_env_defaults(inst).items():
+            env.setdefault(name, value)
 
         container_mib = inst.container_memory_mib // tuning["replicas"]
         shm_mib = max(8192, container_mib // 2)

@@ -624,7 +624,7 @@ at chance while its chat scores are fine.
 
 The traceback ends in `gemma4_mtp.py` `compute_logits`. **Cause:** Gemma 4's multi-token-prediction drafter
 (`--speculative-config '{"model": "google/gemma-4-...-it-assistant", ...}'`) is not CUDA-graph-safe in vLLM
-0.28.0. 0.29.0, the release this project pins, fixes it (its notes list "Gemma4 MTP under CUDA graphs").
+0.28.0. 0.29.0 fixes it (its notes list "Gemma4 MTP under CUDA graphs"), and the project pins a later release.
 **Fix:** your image predates the pin. Cancel the stuck stack update, run `python3 scripts/build_image.py
 --write-config`, and deploy again.
 
@@ -914,8 +914,9 @@ What to expect, and what it means:
 | Line | Meaning |
 |---|---|
 | `Using FLASHINFER attention backend` or `Using FLASH_ATTN attention backend` | which attention kernels; they differ in fp8-cache handling |
-| `Using DEEPGEMM Fp8 MoE backend` (this GPU) or `Using TRITON Fp8 MoE backend` (H100) | native fp8 expert kernels |
-| `Using 'MARLIN' Mxfp4 MoE backend` | 4-bit weights dequantised to bf16 for the matmul: weight-only, not native 4-bit compute. The path both 0.28.0 and 0.29.0 pick for gpt-oss on this GPU. 0.29.0 adds a native `b12x` backend for it (`--moe-backend b12x`), but it refuses gpt-oss at start: `kernel does not support expert biases` |
+| `Using TRITON Fp8 MoE backend` | native fp8 expert kernels. On g7e the stack sets `VLLM_MOE_USE_DEEP_GEMM=0` for this; H100 picked it by itself on 0.28.0 |
+| `Using DEEPGEMM Fp8 MoE backend` | fp8 experts on DeepGEMM: vLLM's default for block-fp8 builds. On g7e it means `extraEnv` turned it back on, and it served 0.78× Triton's request rate (docs/tuning.md, *On g7e, the fp8 MoE kernel*) |
+| `Using 'MARLIN' Mxfp4 MoE backend` | 4-bit weights dequantised to bf16 for the matmul: weight-only, not native 4-bit compute. The path 0.28.0, 0.29.0 and 0.32.0 pick for gpt-oss on this GPU. 0.29.0 adds a native `b12x` backend for it (`--moe-backend b12x`), but it refuses gpt-oss at start: `kernel does not support expert biases` |
 | `Using FlashInferCutlassNvFp4LinearKernel for NVFP4 GEMM` | native 4-bit compute |
 | `Your GPU does not have native support for FP4 computation` | a fallback is in use; expect weight-only performance |
 | `Graph capturing finished in N secs, took X GiB` | CUDA graphs on; X is subtracted from the KV cache |

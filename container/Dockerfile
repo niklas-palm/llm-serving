@@ -4,7 +4,7 @@
 #
 # Pinned rather than :latest. The engine's API surface and flag names change between releases, and
 # an unpinned base means a rebuild can silently change behaviour.
-FROM vllm/vllm-openai:v0.29.0
+FROM vllm/vllm-openai:v0.32.0
 
 COPY serve fetch_weights.py /usr/local/bin/
 RUN chmod +x /usr/local/bin/serve /usr/local/bin/fetch_weights.py

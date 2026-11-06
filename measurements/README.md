@@ -6,8 +6,8 @@ number can be compared with another only when those columns match.
 
 | File | One row is | Rows |
 |---|---|---|
-| `benchmarks.csv` | one concurrency level of one benchmark run: hardware, engines, model, weights, KV precision, topology, flags, kernels, prompt shape, cache state, and the results (req/s, tokens/s, p50/p95/p99, time to first token where streamed, decode speed per request) | 3,100+ |
-| `quality.csv` | one metric of one evaluation of one served configuration: family, model, weights, KV precision, thinking setting, task, setting, score, standard error | 320+ |
+| `benchmarks.csv` | one concurrency level of one benchmark run: hardware, engines, model, weights, KV precision, topology, flags, kernels, prompt shape, cache state, and the results (req/s, tokens/s, p50/p95/p99, time to first token where streamed, decode speed per request) | 4,200+ |
+| `quality.csv` | one metric of one evaluation of one served configuration: family, model, weights, KV precision, thinking setting, task, setting, score, standard error | 360+ |
 | `agentic.csv` | one metric of one agentic benchmark on one served configuration: family, model, weights, KV precision, engines, benchmark, metric, value, n, harness | 270+ |
 
 All rows are vLLM 0.28.0 in this project's container except where `engine_version` says otherwise: the
@@ -19,7 +19,7 @@ sent the way `scripts/benchmark.py --images` sends them: their `prompt_tokens` i
 names the images. Rows dated 2026-10-24 and 2026-10-25 come from one 8 x B200 host on spot in ap-south-1,
 eight engines at TP=1 unless `topology` says otherwise, on the version `engine_version` names (0.29.0, 0.30.0
 or 0.32.0), every run with `--ignore-eos`; the quality rows of that date ran at 0.75 utilisation with the
-model's full context, and the `notes` column says when a drafter was on. Rows dated 2026-10-25 and 2026-10-26 in ap-northeast-1 come from one 8 x H100 host (`p5.48xlarge`) on spot, on the version `engine_version` names; `flags` says when a kernel was forced. Rows dated 2026-10-29 come from one 8 x B200 host (`p6-b200.48xlarge`) on spot in ap-south-1, on the topology the `topology` column names; `flags` says when FlashInfer autotuning was off, the drafter, and the long-context budget. All are measured through the CloudFront endpoint
+model's full context, and the `notes` column says when a drafter was on. Rows dated 2026-10-25 and 2026-10-26 in ap-northeast-1 come from one 8 x H100 host (`p5.48xlarge`) on spot, on the version `engine_version` names; `flags` says when a kernel was forced. Rows dated 2026-10-29 come from one 8 x B200 host (`p6-b200.48xlarge`) on spot in ap-south-1, on the topology the `topology` column names; `flags` says when FlashInfer autotuning was off, the drafter, and the long-context budget. Rows dated 2026-11-05 come from one `g7e.2xlarge` on spot in ap-south-1, every pair back to back on that host: 0.29.0 against 0.32.0 on the version `engine_version` names, `kernels` naming the fp8 MoE kernel and `flags` saying when `VLLM_MOE_USE_DEEP_GEMM=0` chose it; the quality rows of that date ran at 0.80 utilisation with a 2,048-token prefill chunk, as the 2026-09-25 ones. All are measured through the CloudFront endpoint
 from an in-region client with `scripts/benchmark.py` (60 to 120 s per level after warm-up) and
 `scripts/quality.py` (lm-evaluation-harness 0.4.13; the quality rows dated 2026-09-10 are the standard
 suite, evaluation deployments at 0.80 utilisation with a 2,048-token prefill chunk, thinking off; the Gemma 4 rows
