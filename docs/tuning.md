@@ -770,7 +770,10 @@ What it changes:
   (0.90×). That is the vllm#58624 regression; its fix (vllm#58681) is not in a release yet.
 - **To compare kernels yourself**, set `extraEnv: {VLLM_MOE_USE_DEEP_GEMM: "1"}`; the log line changes to
   `Using DEEPGEMM Fp8 MoE backend`.
-- **H100 picked Triton by itself** (our H100 runs of this model, vLLM 0.28.0), and B200 was not measured, so the
+- **H100 picks Triton by itself, and Triton is the faster kernel there too.** Eight engines on one `p5.48xlarge`,
+  vLLM 0.32.0: the log names `TRITON`, and forcing DeepGEMM (`--moe-backend deep_gemm`) served 0.83× its request
+  rate (median over 21 rows, 0.79 to 1.06×; one request decoding 159 against 206 tokens/s; c18h-v32-q30-dg against
+  c18h-v32-q30). 0.32.0 matched 0.29.0 there, 1.01× (0.99 to 1.04×, c18h-v29-q30). B200 was not measured, so the
   stack leaves both alone. On B200 vLLM's DeepGEMM uses an even larger row block for this layout (256, by a reading
   of the code in vllm#58624, not measured there either), so compare the two kernels on a block-fp8 MoE there
   before trusting the default.
@@ -1577,7 +1580,11 @@ waits for it. Why one 32k chunk costs more per token than four 8k chunks was not
 **Raising it costs KV cache.** At startup the engine runs one step of the full budget to measure its
 peak working memory, and the KV cache gets what is left. DeepSeek-V4-Flash at TP=4 on H100s: 30.8 GiB of
 KV per GPU at the default 8,192, 22.1 GiB at 32,768, and at that size its 1M default context no longer
-started.
+started. On vLLM 0.32.0 the same boots gave 31.0, 29.1 and 24.7 GiB at 8,192, 16,384 and 32,768, and at 32,768 the
+engine refused to start until `maxModelLen` drops below 64,568 (c18h-dsv4-tp4-mnbt*). The token count the log
+prints fell faster than the memory, from 3.23M to 1.88M tokens at 16,384: it is the number of full-length requests
+the engine would admit, and the reserve it counts per request grows with the budget for sliding-window layers
+(vllm#51041), so it is not the size of the cache.
 
 ### `kvCacheDtype: fp8`
 
@@ -2742,6 +2749,7 @@ Conditions that change between sections are stated where they matter; the campai
 | Prefix caching on and off with hit counters (*`enablePrefixCaching: true`*), vLLM 0.29.0 | one `p5.48xlarge` (8 × H100) spot in ap-northeast-1 | Llama 3.1 8B, Qwen3-8B (bf16) | eight engines × TP=1, 512 in flight per host, unique and shared-prefix 1k prompts |
 | The move to vLLM 0.29.0 (*What happens when a container is overloaded*) | one `g7e.2xlarge` in ap-south-1 | 30B MoE fp8, plain and with EAGLE-3, both engines on the same host; on 0.29.0 against earlier 0.28.0 rows: dense 32B fp8, 120B MXFP4 (also both engines), Gemma 4 26B NVFP4 and 12B W4A16; the 30B quality suite | the single-engine matrix, 8 to 64 in flight; overload at 64 to 512 with and without `--max-num-queued-reqs`; same kernels chosen on both engines, most rows within 5%, none beyond 11%, quality scores within one standard error |
 | The move to vLLM 0.32.0 and the g7e fp8 MoE kernel (*On g7e, the fp8 MoE kernel*, *Load-time FP8 measures the same as an official FP8 build*) | one `g7e.2xlarge` spot in ap-south-1 | 30B MoE in publisher and load-time fp8, plain and with EAGLE-3, each on 0.29.0 and 0.32.0 and with DeepGEMM and Triton experts; dense 32B fp8, gpt-oss-120b, Gemma 4 26B NVFP4 and 12B W4A16 on both releases; the 30B quality suite on 0.32.0 with each kernel | the single-engine matrix, 8 to 64 in flight, every pair back to back on one host; quality settings as for the 0.29.0 move |
+| The fp8 MoE kernel on H100, and the prefill budget's KV cost on vLLM 0.32.0 (*On g7e, the fp8 MoE kernel*, *`maxNumBatchedTokens: 0`*) | one `p5.48xlarge` (8 × H100) spot in ap-northeast-1 | 30B MoE publisher fp8 on 0.29.0 and 0.32.0, with vLLM's pick (Triton) and with DeepGEMM forced; DeepSeek-V4-Flash TP=4 boots at three budgets | eight engines × TP=1, 64 to 512 in flight per host, every spec back to back on one host; boots read from the startup log |
 | fp8 kernels on B200 and MTP with `disable_eagle_block_drop` (*On B200s, check the fp8 kernel*, *Speculative decoding*), vLLM 0.29.0 to 0.32.0 | one `p6-b200.48xlarge` (8 × B200) spot in ap-south-1 | Llama 3.1 8B bf16 and fp8 (ModelOpt), Qwen3.8-27B bf16 and fp8, LFM2.5-24B-A2B | eight engines × TP=1, 64 to 512 in flight per host, 60 s per level, `--ignore-eos`; prefill timed one request at a time; one prefill step profiled with vLLM's torch profiler |
 | Large models on Capacity Blocks, vLLM 0.30.0 (*Topology*, *Speculative decoding*, *NVFP4*, *Image inputs*, *Engine tuning*) | one `p6-b200.48xlarge` (8 × B200), one `p5.48xlarge` (8 × H100) | DeepSeek-V4 Flash and Pro, GLM-5.3 and GLM-5.3-Flash, Kimi-K2.6, MiniMax-M2.7, Qwen3.8-Flash-Next, Qwen3-Coder-480B, Step-3.7-Flash; Qwen3-30B, Qwen3-235B and gpt-oss-120b repeated | same matrix, 64 to 512 per host; long prompts to 32k unique and cached; image inputs at 16 to 128 |
 | The MoE kernel per layout (*`enableExpertParallel: false`*), vLLM 0.30.0 | one `p5.48xlarge` (8 × H100) spot in ap-northeast-1 | MiniMax-M2.7 fp8 | two engines × TP=4, with and without expert parallelism, `--moe-backend` forced to each kernel, 64 to 512 in flight per host |
@@ -2754,7 +2762,8 @@ first token moves ±25% between identical runs. A difference inside those bands 
 A later engine release moves the kernel choices named in *The evidence* and *troubleshooting.md*, and
 with them every 4-bit figure and the KV precision result. Re-measured on 0.32.0, on one g7e against 0.29.0 on the
 same host: the 30B MoE in publisher and load-time fp8, plain and with EAGLE-3, the dense 32B fp8, gpt-oss-120b, Gemma 4
-26B NVFP4 and 12B W4A16, and the 30B's quality suite. Not re-measured on 0.29.0 or 0.32.0: the 0.28.0 multi-GPU
+26B NVFP4 and 12B W4A16, and the 30B's quality suite; on eight H100s, the 30B in publisher fp8 against 0.29.0
+and with each fp8 MoE kernel. Not re-measured on 0.29.0 or 0.32.0: the 0.28.0 multi-GPU
 topology and H100 comparison rows, prompts above 4,000 tokens, the host-memory KV tier, Mistral, Nemotron, the 80B hybrid and
 the agentic benchmarks. Every path that was re-measured kept its kernels, apart from the g7e fp8 experts (*On g7e, the
 fp8 MoE kernel*), so these are expected to hold, but they are 0.28.0 numbers.
