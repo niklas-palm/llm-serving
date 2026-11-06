@@ -222,7 +222,8 @@ extraArgs: ""
 # (kernel backends, attention backend, download behaviour). A model card's recipe often names them.
 #   extraEnv:
 #     VLLM_USE_FLASHINFER_MOE_FP4: "0"
-# Unvalidated beyond the names. Empty: none.
+# Unvalidated beyond the names. Empty: none. On g7e the stack also sets VLLM_MOE_USE_DEEP_GEMM=0 (fp8 experts on
+# Triton, measured 1.28x DeepGEMM); a value here wins. docs/tuning.md, "On g7e, the fp8 MoE kernel".
 extraEnv: {}
 
 # ---------------------------------------------------------------------------- tuning

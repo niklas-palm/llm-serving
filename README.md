@@ -247,9 +247,8 @@ measured default. Sizes are the checkpoint's, GPUs are per engine:
 | `google/gemma-4-31B-it` | dense, hybrid attention | 1 | bf16, Red Hat fp8, Google QAT W4A16, NVIDIA NVFP4 | as above; in bf16 also `maxModelLen: 131072`: its 262k context does not fit next to 62 GB of weights on a 96 GB card (*Will my model fit?*) |
 | `google/gemma-4-12B-it` | dense, encoder-free multimodal | 1 | bf16, Red Hat fp8, Google QAT W4A16 | as above |
 
-Served on eight H100s or eight B200s with vLLM 0.30.0 (set `FROM vllm/vllm-openai:v0.30.0` in
-`container/Dockerfile` and the matching `TAG` in `scripts/build_image.py`; the shipped 0.29.0 was not tried
-with these). Give all of them `extraEnv: {VLLM_ENGINE_READY_TIMEOUT_S: "1200"}` (troubleshooting, *never
+Served on eight H100s or eight B200s with vLLM 0.30.0, before the pin moved to 0.32.0. DeepSeek-V4-Flash
+was also served on 0.32.0; the others were not re-run on it. Give all of them `extraEnv: {VLLM_ENGINE_READY_TIMEOUT_S: "1200"}` (troubleshooting, *never
 becomes ready*), and raise `healthCheckGraceMinutes` for a first start longer than 30 minutes (*Health-check
 grace for a slow first start* in docs/tuning.md):
 
