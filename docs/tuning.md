@@ -775,7 +775,8 @@ What it changes:
   vLLM 0.32.0: the log names `TRITON`, and forcing DeepGEMM (`--moe-backend deep_gemm`) served 0.83× its request
   rate (median over 21 rows, 0.79 to 1.06×; one request decoding 159 against 206 tokens/s; c18h-v32-q30-dg against
   c18h-v32-q30). 0.32.0 matched 0.29.0 there, 1.01× (0.99 to 1.04×, c18h-v29-q30).
-- **B200 picks FlashInfer's TRT-LLM fp8 MoE kernel, and it is the fastest of the three there.** Eight engines on one
+- **B200 picks FlashInfer's TRT-LLM fp8 MoE kernel, and for the 30B's block-fp8 build it is the fastest of the three
+  there.** Eight engines on one
   `p6-b200.48xlarge`, vLLM 0.34.0: DeepGEMM forced served 0.82× its request rate (median over 25 rows, 0.74 to
   1.03×), Triton forced 0.93× (0.91 to 1.00×) (c19b-q30-dg, c19b-q30-tr against c19b-q30). So the stack sets nothing
   on H100 or B200.
@@ -1378,7 +1379,8 @@ same hardware crashed under load.
 **vLLM 0.34.0 sizes the KV cache after warm-up**, from the memory actually free, and defaults this setting to 1.0
 when it does. The stack still passes 0.95, and on g7e that measured the same as 1.0 and as the sizing before 0.34
 (`--no-enable-extensible-kv-cache`): 1.00× either way over 36 rows, 1.26M against 1.29M tokens of KV (c19-v34-q30,
--u100, -noext, the publisher fp8 30B). Not measured on a model that fills the card, where the last 5% matters most.
+-u100, -noext, the publisher fp8 30B). Not measured on a model that fills the card, where the last 5% matters most,
+and the 0.97 limit above comes from 0.28.0 and was not re-run, so keep 0.95.
 
 **0.95 itself is not universally safe.** Three cases where it is too high:
 
@@ -1446,10 +1448,10 @@ work: 1k-token prompts with 190-token answers.
 prefix; *Choosing an operating concurrency* gives both numbers. Sizing a fleet from
 the cached figure when your traffic has no shared prefix **under-provisions by about 2×**.
 
-**The cache's block size is not a lever either.** vLLM 0.34.0 raised its default from 16 to 64 tokens. On one g7e
+**The cache's block size measured no effect.** vLLM 0.34.0 raised its default from 16 to 64 tokens. On one g7e
 with the publisher fp8 30B, 16 against 64 measured 0.99× over 36 rows, cached prompts and multi-turn
-conversations included (c19-v34-q30-b16 against c19-v34-q30). Leave it at the engine's default unless a model's
-recipe names one.
+conversations included (c19-v34-q30-b16 against c19-v34-q30). Measured on that model only; leave it at the engine's
+default unless a model's recipe names one.
 
 #### Prefix caching is a routing decision
 
@@ -2764,7 +2766,7 @@ Conditions that change between sections are stated where they matter; the campai
 | The move to vLLM 0.29.0 (*What happens when a container is overloaded*) | one `g7e.2xlarge` in ap-south-1 | 30B MoE fp8, plain and with EAGLE-3, both engines on the same host; on 0.29.0 against earlier 0.28.0 rows: dense 32B fp8, 120B MXFP4 (also both engines), Gemma 4 26B NVFP4 and 12B W4A16; the 30B quality suite | the single-engine matrix, 8 to 64 in flight; overload at 64 to 512 with and without `--max-num-queued-reqs`; same kernels chosen on both engines, most rows within 5%, none beyond 11%, quality scores within one standard error |
 | The move to vLLM 0.32.0 and the g7e fp8 MoE kernel (*On g7e, the fp8 MoE kernel*, *Load-time FP8 measures the same as an official FP8 build*) | one `g7e.2xlarge` spot in ap-south-1 | 30B MoE in publisher and load-time fp8, plain and with EAGLE-3, each on 0.29.0 and 0.32.0 and with DeepGEMM and Triton experts; dense 32B fp8, gpt-oss-120b, Gemma 4 26B NVFP4 and 12B W4A16 on both releases; the 30B quality suite on 0.32.0 with each kernel | the single-engine matrix, 8 to 64 in flight, every pair back to back on one host; quality settings as for the 0.29.0 move |
 | The fp8 MoE kernel on H100, and the prefill budget's KV cost on vLLM 0.32.0 (*On g7e, the fp8 MoE kernel*, *`maxNumBatchedTokens: 0`*) | one `p5.48xlarge` (8 × H100) spot in ap-northeast-1 | 30B MoE publisher fp8 on 0.29.0 and 0.32.0, with vLLM's pick (Triton) and with DeepGEMM forced; DeepSeek-V4-Flash TP=4 boots at three budgets | eight engines × TP=1, 64 to 512 in flight per host, every spec back to back on one host; boots read from the startup log |
-| The move to vLLM 0.34.0, its KV cache sizing and block size, and the fp8 MoE kernel on B200 (*`gpuMemoryUtilization: 0.95`*, *On g7e, the fp8 MoE kernel*, *`enablePrefixCaching: true`*) | one `g7e.2xlarge` and one `p6-b200.48xlarge` (8 × B200), both spot in ap-south-1 | on g7e: the 30B MoE in publisher and load-time fp8, plain and with EAGLE-3, gpt-oss-120b and Gemma 4 26B NVFP4 on 0.32.0 and 0.34.0, the 30B with 0.95, 1.0 and the pre-0.34 KV sizing and with block size 16 and 64, its quality suite on 0.34.0; on B200 the 30B with each fp8 MoE kernel, MiniMax-M3.1-Flash and Mistral Large 4 with and without their drafters | the single-engine matrix on g7e, 64 to 512 in flight per host on B200, every pair back to back on one host |
+| The move to vLLM 0.34.0, its KV cache sizing and block size, and the fp8 MoE kernel on B200 (*`gpuMemoryUtilization: 0.95`*, *On g7e, the fp8 MoE kernel*, *`enablePrefixCaching: true`*) | one `g7e.2xlarge` and one `p6-b200.48xlarge` (8 × B200), both spot in ap-south-1 | on g7e: the 30B MoE in publisher and load-time fp8, plain and with EAGLE-3, gpt-oss-120b and Gemma 4 26B NVFP4 on 0.32.0 and 0.34.0, the 30B with 0.95, 1.0 and the pre-0.34 KV sizing and with block size 16 and 64, its quality suite on 0.34.0 and Inkling 2 Mini in its day-0 image; on B200 the 30B with each fp8 MoE kernel, MiniMax-M3.1-Flash and Mistral Large 4 with and without their drafters | the single-engine matrix on g7e, 64 to 512 in flight per host on B200, every pair back to back on one host |
 | fp8 kernels on B200 and MTP with `disable_eagle_block_drop` (*On B200s, check the fp8 kernel*, *Speculative decoding*), vLLM 0.29.0 to 0.32.0 | one `p6-b200.48xlarge` (8 × B200) spot in ap-south-1 | Llama 3.1 8B bf16 and fp8 (ModelOpt), Qwen3.8-27B bf16 and fp8, LFM2.5-24B-A2B | eight engines × TP=1, 64 to 512 in flight per host, 60 s per level, `--ignore-eos`; prefill timed one request at a time; one prefill step profiled with vLLM's torch profiler |
 | Large models on Capacity Blocks, vLLM 0.30.0 (*Topology*, *Speculative decoding*, *NVFP4*, *Image inputs*, *Engine tuning*) | one `p6-b200.48xlarge` (8 × B200), one `p5.48xlarge` (8 × H100) | DeepSeek-V4 Flash and Pro, GLM-5.3 and GLM-5.3-Flash, Kimi-K2.6, MiniMax-M2.7, Qwen3.8-Flash-Next, Qwen3-Coder-480B, Step-3.7-Flash; Qwen3-30B, Qwen3-235B and gpt-oss-120b repeated | same matrix, 64 to 512 per host; long prompts to 32k unique and cached; image inputs at 16 to 128 |
 | The MoE kernel per layout (*`enableExpertParallel: false`*), vLLM 0.30.0 | one `p5.48xlarge` (8 × H100) spot in ap-northeast-1 | MiniMax-M2.7 fp8 | two engines × TP=4, with and without expert parallelism, `--moe-backend` forced to each kernel, 64 to 512 in flight per host |
