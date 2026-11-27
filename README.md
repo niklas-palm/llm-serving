@@ -247,8 +247,8 @@ measured default. Sizes are the checkpoint's, GPUs are per engine:
 | `google/gemma-4-31B-it` | dense, hybrid attention | 1 | bf16, Red Hat fp8, Google QAT W4A16, NVIDIA NVFP4 | as above; in bf16 also `maxModelLen: 131072`: its 262k context does not fit next to 62 GB of weights on a 96 GB card (*Will my model fit?*) |
 | `google/gemma-4-12B-it` | dense, encoder-free multimodal | 1 | bf16, Red Hat fp8, Google QAT W4A16 | as above |
 
-Served on eight H100s or eight B200s with vLLM 0.30.0, before the pin moved to 0.32.0. DeepSeek-V4-Flash
-was also served on 0.32.0; the others were not re-run on it. Give all of them `extraEnv: {VLLM_ENGINE_READY_TIMEOUT_S: "1200"}` (troubleshooting, *never
+Served on eight H100s or eight B200s with vLLM 0.30.0, or 0.34.0 where the row says so. DeepSeek-V4-Flash
+was also served on 0.32.0; the others were not re-run on later releases. Give all of them `extraEnv: {VLLM_ENGINE_READY_TIMEOUT_S: "1200"}` (troubleshooting, *never
 becomes ready*), and raise `healthCheckGraceMinutes` for a first start longer than 30 minutes (*Health-check
 grace for a slow first start* in docs/tuning.md):
 
@@ -260,12 +260,17 @@ grace for a slow first start* in docs/tuning.md):
 | `zai-org/GLM-5.3-Flash` | MoE | 2 to 8 | publisher fp8, NVIDIA NVFP4 | parsers `glm47`; on H100 TP=8 and `kvCacheDtype: auto` (the recipe: no fp8 KV on Hopper); it always thinks |
 | `moonshotai/Kimi-K2.6` | MoE, 1T, native INT4 | 4 or 8 (B200) | INT4 | `extraArgs: --trust-remote-code --default-chat-template-kwargs '{"thinking": false}'` for thinking off; parsers `kimi_k2`; `kvCacheDtype: auto`; does not fit 8 × H100 at 32k |
 | `MiniMaxAI/MiniMax-M2.7` | MoE | 2 (B200), 4 (H100) | publisher fp8 | `extraArgs: --trust-remote-code`; parsers `minimax_m2` |
+| `MiniMaxAI/MiniMax-M3.1-Flash` (0.34.0) | MoE, sparse attention, 428B | 4 per engine (B200) | publisher | `kvCacheDtype: auto`, `extraArgs: --kv-cache-dtype fp8 --attention-config '{"indexer_kv_dtype": "fp8"}' --block-size 128 --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' --disable-hybrid-kv-cache-manager`, `extraEnv: {VLLM_FLOAT32_MATMUL_PRECISION: "high"}`, `maxModelLen: 131072`; parsers `minimax_m3`. The later `--kv-cache-dtype` wins: the recipe's NVFP4 KV cache needs CUDA 13.4 and the image has 13.0. Ran with `VLLM_ENGINE_READY_TIMEOUT_S: "3600"` and a start of about 12 minutes; its DSpark drafter is one `--speculative-config` |
 | `Qwen/Qwen3.8-Flash-Next-FP8` | hybrid MoE, multimodal | 4 or 8 (H100) | publisher fp8 | `kvCacheDtype: auto` (refuses fp8), `gpuMemoryUtilization: 0.85`, `enableExpertParallel`, `extraEnv: {VLLM_PLE_CPU_OFFLOAD: "1"}`, `extraArgs: --moe-backend triton --no-enable-flashinfer-autotune`; parsers `qwen3_coder` / `qwen3` |
 | `Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8` | MoE, 35B active | 8 (H100) | publisher fp8 | `maxModelLen: 32768`; `toolCallParser: qwen3_coder` |
 | `stepfun-ai/Step-3.7-Flash-FP8` | MoE | 4 (H100) | publisher fp8 | `extraArgs: --trust-remote-code`; parsers `step3p5` |
 
 `XiaomiMiMo/MiMo-V2.6-Flash-RL` (fp8) does not load on vLLM 0.27 to 0.30; the fix (vllm#57508, #58142) is
 on vLLM's main branch.
+Inkling 2 is not in vLLM 0.34.0. `thinkingmachines/Inkling-2-Mini` served on one g7e from vLLM's day-0 image
+(`vllm/vllm-openai:inkling-2-mini` as the Dockerfile's base, parsers `inkling`); its DSpark drafter fails there at
+start (`no kernel image is available for execution on the device`). `Inkling-2-Small` did not load in its day-0
+image on eight B200s (an assertion on its quantisation config, with or without `--quantization inkling2`).
 
 Formats, kernels and what each one costs in throughput and in answers are in *Choosing a model to host*,
 *Quantisation is two independent decisions* and the two quality sections of

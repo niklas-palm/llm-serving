@@ -125,8 +125,9 @@ def engine_env_defaults(inst: Instance) -> dict[str, str]:
     128 rows on this GPU since vLLM 0.30 (vllm#58624), 64 before. A decode step gives each expert a few tokens, so
     most of that matmul is padding. Measured on Qwen3-30B-A3B-2507-FP8, one engine, vLLM 0.32.0: Triton served 1.28x
     DeepGEMM's request rate on batched shapes (median), and 1.13x on 0.29.0, with the same quality scores. Load-time
-    fp8 (`quantization: fp8`) is per-tensor and already runs Triton. Not set for H100, which picks Triton by itself
-    (DeepGEMM forced there measured 0.83x), or B200, not measured. docs/tuning.md, "On g7e, the fp8 MoE kernel".
+    fp8 (`quantization: fp8`) is per-tensor and already runs Triton. vLLM 0.34.0 still picks DeepGEMM here. Not set for
+    H100, which picks Triton by itself (DeepGEMM forced there measured 0.83x), or B200, which picks FlashInfer's TRT-LLM
+    kernel, the fastest there for the same 30B (Triton 0.93x, DeepGEMM 0.82x). docs/tuning.md, "On g7e, the fp8 MoE kernel".
     """
     if inst.gpu == "RTX PRO 6000 Blackwell":
         return {"VLLM_MOE_USE_DEEP_GEMM": "0"}
