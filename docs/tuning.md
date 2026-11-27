@@ -16,11 +16,12 @@ Three questions settle most of the configuration:
    decide. Short prompts and long answers: decode, so bandwidth, fp8 weights and an fp8 cache decide.
    One command tells you (*Interpreting your own measurements*).
 
-The project pins vLLM 0.32.0. Most numbers here were measured with 0.28.0. Each move since was measured on one
+The project pins vLLM 0.34.0. Most numbers here were measured with 0.28.0. Each move since was measured on one
 engine against the release before, on the same paths. 0.29.0 picked the same kernels and matched 0.28.0 on every
 model path re-measured: most rows within 5%, none beyond 11%. 0.32.0 matched 0.29.0 the same way (medians 1.00 to
-1.02×), with one exception that the stack now handles: fp8 mixture-of-experts on g7e (*On g7e, the fp8 MoE kernel*;
-*Where the numbers come from*). The
+1.02×), with one exception that the stack now handles: fp8 mixture-of-experts on g7e (*On g7e, the fp8 MoE kernel*).
+0.34.0 matched 0.32.0 on every path re-measured (medians 1.00 to 1.02×), with its new KV cache sizing and block size
+(*`gpuMemoryUtilization: 0.95`*, *Where the numbers come from*). The
 kernels are named where they matter, and the rows themselves are in [measurements/](../measurements/README.md).
 
 Reading paths, if you have one job today:
@@ -773,10 +774,13 @@ What it changes:
 - **H100 picks Triton by itself, and Triton is the faster kernel there too.** Eight engines on one `p5.48xlarge`,
   vLLM 0.32.0: the log names `TRITON`, and forcing DeepGEMM (`--moe-backend deep_gemm`) served 0.83× its request
   rate (median over 21 rows, 0.79 to 1.06×; one request decoding 159 against 206 tokens/s; c18h-v32-q30-dg against
-  c18h-v32-q30). 0.32.0 matched 0.29.0 there, 1.01× (0.99 to 1.04×, c18h-v29-q30). B200 was not measured, so the
-  stack leaves both alone. On B200 vLLM's DeepGEMM uses an even larger row block for this layout (256, by a reading
-  of the code in vllm#58624, not measured there either), so compare the two kernels on a block-fp8 MoE there
-  before trusting the default.
+  c18h-v32-q30). 0.32.0 matched 0.29.0 there, 1.01× (0.99 to 1.04×, c18h-v29-q30).
+- **B200 picks FlashInfer's TRT-LLM fp8 MoE kernel, and it is the fastest of the three there.** Eight engines on one
+  `p6-b200.48xlarge`, vLLM 0.34.0: DeepGEMM forced served 0.82× its request rate (median over 25 rows, 0.74 to
+  1.03×), Triton forced 0.93× (0.91 to 1.00×) (c19b-q30-dg, c19b-q30-tr against c19b-q30). So the stack sets nothing
+  on H100 or B200.
+- **vLLM 0.34.0 still picks DeepGEMM on g7e.** The upstream change that prefers Triton on this GPU family
+  (vllm#58989) was not merged in it, so the stack keeps the setting.
 - **Only fp8 experts are affected.** vLLM reads the variable only where it picks the fp8 MoE kernel (and in
   DeepGEMM's warmup), so NVFP4, MXFP4, 4-bit and dense models run as before; their pairs above were measured
   without it.
@@ -1371,6 +1375,11 @@ memory profiling and fails under real load. 0.95 → 0.97
 measured **+1.6%**; at 0.97 the mixture-of-experts model above was stable, while a dense 27B on the
 same hardware crashed under load.
 
+**vLLM 0.34.0 sizes the KV cache after warm-up**, from the memory actually free, and defaults this setting to 1.0
+when it does. The stack still passes 0.95, and on g7e that measured the same as 1.0 and as the sizing before 0.34
+(`--no-enable-extensible-kv-cache`): 1.00× either way over 36 rows, 1.26M against 1.29M tokens of KV (c19-v34-q30,
+-u100, -noext, the publisher fp8 30B). Not measured on a model that fills the card, where the last 5% matters most.
+
 **0.95 itself is not universally safe.** Three cases where it is too high:
 
 1. **Dense models**, as the 27B above.
@@ -1436,6 +1445,11 @@ work: 1k-token prompts with 190-token answers.
 **The caveat is about traffic, not the flag.** Figures here say whether prompts were unique or shared a
 prefix; *Choosing an operating concurrency* gives both numbers. Sizing a fleet from
 the cached figure when your traffic has no shared prefix **under-provisions by about 2×**.
+
+**The cache's block size is not a lever either.** vLLM 0.34.0 raised its default from 16 to 64 tokens. On one g7e
+with the publisher fp8 30B, 16 against 64 measured 0.99× over 36 rows, cached prompts and multi-turn
+conversations included (c19-v34-q30-b16 against c19-v34-q30). Leave it at the engine's default unless a model's
+recipe names one.
 
 #### Prefix caching is a routing decision
 
@@ -1906,7 +1920,7 @@ by the acceptance rate the log prints, which was the same in both rows.
 Google ships a four-layer draft model for each Gemma 4 size (`google/gemma-4-<size>-it-assistant`); it
 shares the target's KV cache and costs 2.7 GiB of it. On vLLM 0.28.0 it crash-loops at start (`Cannot copy
 between CPU and CUDA tensors during CUDA graph capture` in `gemma4_mtp.py`; troubleshooting has the entry).
-0.29.0 fixes it (the project now pins 0.32.0), and served the same model without the drafter within ±3%
+0.29.0 fixes it (the project now pins 0.34.0), and served the same model without the drafter within ±3%
 of 0.28.0 at every level, so the comparison below is engine-neutral. The 12B in fp8
 with `--speculative-config '{"model": "google/gemma-4-12B-it-assistant", "num_speculative_tokens": 4}'`,
 one engine, mean acceptance 3.1 of 4 drafted tokens:
@@ -1971,12 +1985,12 @@ driven from an in-region client. At 512 in flight, whole fleet:
 
 Which kernel ran matters as much as which weights. The startup log names it. On this GPU the 120B
 MXFP4 experts ran through the Marlin backend, which dequantises to bf16 for the matmul. It is the path
-vLLM picks for gpt-oss on this GPU in 0.28.0, 0.29.0 and 0.32.0; the native `b12x` backend that 0.29.0 adds for
+vLLM picks for gpt-oss on this GPU in 0.28.0, 0.29.0, 0.32.0 and 0.34.0; the native `b12x` backend that 0.29.0 adds for
 this GPU refuses the model (`kernel does not support expert biases`). On the H100 the same model used the
 Triton MXFP4 kernel. The 27B NVFP4 build ran on the native FlashInfer CUTLASS FP4 kernel here. Read the
 lines `Using '...' Mxfp4 MoE backend`, `Using ... NvFp4 MoE backend`, `Using ... attention backend` and
 `Using ... Fp8 MoE backend` before comparing two GPUs or two formats; the numbers in this document carry
-the kernels named, and 0.29.0 and 0.32.0 chose the same ones on every path re-measured, except the fp8 experts of
+the kernels named, and 0.29.0, 0.32.0 and 0.34.0 chose the same ones on every path re-measured, except the fp8 experts of
 a publisher's block-fp8 build on this GPU, which the stack moves to Triton (*On g7e, the fp8 MoE kernel*). The three Gemma 4 rows (26B, 31B, 12B) ran on vLLM's Triton
 attention kernel, not FlashInfer or FlashAttention: their global layers use 512-wide heads next to
 256-wide local ones, and the log says so (`heterogeneous head dimensions ... forcing TRITON_ATTN backend`).
@@ -2750,6 +2764,7 @@ Conditions that change between sections are stated where they matter; the campai
 | The move to vLLM 0.29.0 (*What happens when a container is overloaded*) | one `g7e.2xlarge` in ap-south-1 | 30B MoE fp8, plain and with EAGLE-3, both engines on the same host; on 0.29.0 against earlier 0.28.0 rows: dense 32B fp8, 120B MXFP4 (also both engines), Gemma 4 26B NVFP4 and 12B W4A16; the 30B quality suite | the single-engine matrix, 8 to 64 in flight; overload at 64 to 512 with and without `--max-num-queued-reqs`; same kernels chosen on both engines, most rows within 5%, none beyond 11%, quality scores within one standard error |
 | The move to vLLM 0.32.0 and the g7e fp8 MoE kernel (*On g7e, the fp8 MoE kernel*, *Load-time FP8 measures the same as an official FP8 build*) | one `g7e.2xlarge` spot in ap-south-1 | 30B MoE in publisher and load-time fp8, plain and with EAGLE-3, each on 0.29.0 and 0.32.0 and with DeepGEMM and Triton experts; dense 32B fp8, gpt-oss-120b, Gemma 4 26B NVFP4 and 12B W4A16 on both releases; the 30B quality suite on 0.32.0 with each kernel | the single-engine matrix, 8 to 64 in flight, every pair back to back on one host; quality settings as for the 0.29.0 move |
 | The fp8 MoE kernel on H100, and the prefill budget's KV cost on vLLM 0.32.0 (*On g7e, the fp8 MoE kernel*, *`maxNumBatchedTokens: 0`*) | one `p5.48xlarge` (8 × H100) spot in ap-northeast-1 | 30B MoE publisher fp8 on 0.29.0 and 0.32.0, with vLLM's pick (Triton) and with DeepGEMM forced; DeepSeek-V4-Flash TP=4 boots at three budgets | eight engines × TP=1, 64 to 512 in flight per host, every spec back to back on one host; boots read from the startup log |
+| The move to vLLM 0.34.0, its KV cache sizing and block size, and the fp8 MoE kernel on B200 (*`gpuMemoryUtilization: 0.95`*, *On g7e, the fp8 MoE kernel*, *`enablePrefixCaching: true`*) | one `g7e.2xlarge` and one `p6-b200.48xlarge` (8 × B200), both spot in ap-south-1 | on g7e: the 30B MoE in publisher and load-time fp8, plain and with EAGLE-3, gpt-oss-120b and Gemma 4 26B NVFP4 on 0.32.0 and 0.34.0, the 30B with 0.95, 1.0 and the pre-0.34 KV sizing and with block size 16 and 64, its quality suite on 0.34.0; on B200 the 30B with each fp8 MoE kernel, MiniMax-M3.1-Flash and Mistral Large 4 with and without their drafters | the single-engine matrix on g7e, 64 to 512 in flight per host on B200, every pair back to back on one host |
 | fp8 kernels on B200 and MTP with `disable_eagle_block_drop` (*On B200s, check the fp8 kernel*, *Speculative decoding*), vLLM 0.29.0 to 0.32.0 | one `p6-b200.48xlarge` (8 × B200) spot in ap-south-1 | Llama 3.1 8B bf16 and fp8 (ModelOpt), Qwen3.8-27B bf16 and fp8, LFM2.5-24B-A2B | eight engines × TP=1, 64 to 512 in flight per host, 60 s per level, `--ignore-eos`; prefill timed one request at a time; one prefill step profiled with vLLM's torch profiler |
 | Large models on Capacity Blocks, vLLM 0.30.0 (*Topology*, *Speculative decoding*, *NVFP4*, *Image inputs*, *Engine tuning*) | one `p6-b200.48xlarge` (8 × B200), one `p5.48xlarge` (8 × H100) | DeepSeek-V4 Flash and Pro, GLM-5.3 and GLM-5.3-Flash, Kimi-K2.6, MiniMax-M2.7, Qwen3.8-Flash-Next, Qwen3-Coder-480B, Step-3.7-Flash; Qwen3-30B, Qwen3-235B and gpt-oss-120b repeated | same matrix, 64 to 512 per host; long prompts to 32k unique and cached; image inputs at 16 to 128 |
 | The MoE kernel per layout (*`enableExpertParallel: false`*), vLLM 0.30.0 | one `p5.48xlarge` (8 × H100) spot in ap-northeast-1 | MiniMax-M2.7 fp8 | two engines × TP=4, with and without expert parallelism, `--moe-backend` forced to each kernel, 64 to 512 in flight per host |
@@ -2760,7 +2775,7 @@ spot instance ten days later within +0 to +3% on every shape and level; a single
 (cached shapes ±4%), and two regions' single-engine baselines matched within 4%. The p95 of time to
 first token moves ±25% between identical runs. A difference inside those bands is not a result.
 A later engine release moves the kernel choices named in *The evidence* and *troubleshooting.md*, and
-with them every 4-bit figure and the KV precision result. Re-measured on 0.32.0, on one g7e against 0.29.0 on the
+with them every 4-bit figure and the KV precision result. Re-measured on 0.32.0 and again on 0.34.0, on one g7e against the release before on the
 same host: the 30B MoE in publisher and load-time fp8, plain and with EAGLE-3, the dense 32B fp8, gpt-oss-120b, Gemma 4
 26B NVFP4 and 12B W4A16, and the 30B's quality suite; on eight H100s, the 30B in publisher fp8 against 0.29.0
 and with each fp8 MoE kernel. Not re-measured on 0.29.0 or 0.32.0: the 0.28.0 multi-GPU
